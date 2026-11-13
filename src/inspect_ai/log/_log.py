@@ -694,10 +694,11 @@ class EvalSample(BaseModel):
             del values["score"]
 
         if "transcript" in values:
-            # promote 'transcript' up to 'events' and 'attachments'
-            eval_events = EvalEvents(**values["transcript"])
-            values["events"] = eval_events.events
-            values["attachments"] = eval_events.content
+            # promote 'transcript' up to 'events' and 'attachments' (left
+            # unvalidated so they are validated with this read's context)
+            transcript = values["transcript"]
+            values["events"] = transcript.get("events", [])
+            values["attachments"] = transcript.get("content", {})
 
             # get rid of transcript (property accessor w/ deprecation
             # warning will handle this)
@@ -1357,6 +1358,15 @@ class EvalLog(BaseModel):
 
     config_updates: list[ConfigUpdate] | None = Field(default=None)
     """Mid-run configuration changes applied via the control channel (`inspect ctl config`)."""
+
+    total_samples: int | None = Field(default=None)
+    """Sample/epoch runs accepted for this attempt, saved when the eval finishes.
+
+    Includes the selected seed runs and runs accepted later, even when they
+    never start. Equals ``results.total_samples`` when evaluation results are
+    written; later rescoring can change the results count. Does not predict
+    what a source adds later. ``None`` means unknown, including logs from
+    older versions and running, crashed and recovered logs."""
 
     tags: list[str] = Field(default_factory=list)
     """Current tags (eval-time + edits). Do not set directly; use edit_eval_log()."""
