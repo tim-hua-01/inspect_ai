@@ -393,12 +393,15 @@ class DockerSandboxEnvironment(SandboxEnvironment):
         #   137: SIGKILL escalation via -k (command ignored SIGTERM)
         #   143: BusyBox timeout, command killed by SIGTERM (128 + 15)
         #
-        # 137 and 143 are ambiguous: OOM kills also produce 137, and
-        # any SIGTERM from any source produces 143. we use wall-clock
-        # time to disambiguate these from actual timeouts.
+        # all three are ambiguous: the command can exit 124 itself (e.g. a
+        # script ending in its own `timeout 10 pytest`), OOM kills also
+        # produce 137, and any SIGTERM from any source produces 143. the
+        # in-container timeout cannot fire before `timeout` seconds have
+        # passed since this call started, so we use wall-clock time to
+        # disambiguate these from actual timeouts.
         elapsed = time.monotonic() - start_time
         if timeout is not None and exec_result.returncode in (124, 137, 143):
-            if exec_result.returncode == 124 or elapsed >= timeout:
+            if elapsed >= timeout:
                 # preserve the partial output captured before the timeout so it can
                 # be surfaced to the caller via SandboxTimeoutError.truncated_output
                 timeout_error = TimeoutError(
@@ -408,8 +411,9 @@ class DockerSandboxEnvironment(SandboxEnvironment):
                 if partial_output:
                     setattr(timeout_error, "truncated_output", partial_output)
                 raise timeout_error
-            # else: signal-death exit code but too fast to be a timeout
-            # (e.g. OOM kill) — fall through and return the ExecResult
+            # else: the command's own exit code or a signal death that came
+            # too fast to be a timeout (e.g. OOM kill) — fall through and
+            # return the ExecResult
 
         failure = classify_exec_failure(
             exec_result,
@@ -476,10 +480,14 @@ class DockerSandboxEnvironment(SandboxEnvironment):
         file = self.container_file(file)
 
         # The requested user may be root, so utilities must not come from the
-        # image's PATH.
+        # image's PATH. The commands run from "/", as `read_file()`'s do: the
+        # path is absolute, and the user may be unable to enter the default
+        # working directory.
         parent = Path(file).parent.as_posix()
         if parent != ".":
-            result = await self.exec(pinned_command(["mkdir", "-p", parent]), user=user)
+            result = await self.exec(
+                pinned_command(["mkdir", "-p", parent]), cwd="/", user=user
+            )
             if not result.success:
                 raise_for_unsupported_user(result.stderr or result.stdout, user)
                 if "permission denied" in result.stderr.casefold():
@@ -492,6 +500,7 @@ class DockerSandboxEnvironment(SandboxEnvironment):
             result = await self.exec(
                 pinned_shell_command('set -e\ntee -- "$1" > /dev/null', file),
                 input=contents,
+                cwd="/",
                 timeout=TIMEOUT,
                 user=user,
             )
@@ -502,6 +511,7 @@ class DockerSandboxEnvironment(SandboxEnvironment):
                     'set -e\nbase64 -d | tee -- "$1" > /dev/null', file
                 ),
                 input=base64_contents,
+                cwd="/",
                 timeout=TIMEOUT,
                 user=user,
             )
@@ -509,7 +519,7 @@ class DockerSandboxEnvironment(SandboxEnvironment):
             raise_for_unsupported_user(result.stderr or result.stdout, user)
             if "permission denied" in result.stderr.casefold():
                 ls_result = await self.exec(
-                    pinned_command(["ls", "-la", "."]), user=user
+                    pinned_command(["ls", "-la", "--", parent]), cwd="/", user=user
                 )
                 error_string = f"Permission was denied. Error details: {result.stderr}; ls -la: {ls_result.stdout}"
                 raise PermissionError(error_string)

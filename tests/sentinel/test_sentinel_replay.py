@@ -3,16 +3,21 @@
 import bisect
 import dataclasses
 import json
+import logging
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
+from datetime import datetime, timezone
 from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 import anyio
 import pytest
 import tenacity
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
+from shortuuid import uuid
+from test_helpers.utils import collide_murmur3
 
 from inspect_ai import Task, eval
 from inspect_ai._sentinel._integration import (
@@ -22,18 +27,24 @@ from inspect_ai._sentinel._integration import (
 )
 from inspect_ai._sentinel._steps import ListView, PoolView
 from inspect_ai._util._async import tg_collect
+from inspect_ai._util.content import ContentImage, ContentText
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai.agent import (
     Agent,
     AgentState,
     agent,
+    agent_bridge,
     as_solver,
     as_tool,
     handoff,
     react,
+    run,
 )
+from inspect_ai.agent._bridge.types import AgentBridge
 from inspect_ai.approval import Approval, ApprovalPolicy, Approver, approver
 from inspect_ai.approval._approval import ApprovalDecision
+from inspect_ai.approval._human import acp as acp_module
+from inspect_ai.approval._human import approver as approver_module
 from inspect_ai.dataset import Sample
 from inspect_ai.event import (
     ApprovalEvent,
@@ -41,13 +52,22 @@ from inspect_ai.event import (
     ModelEvent,
     SentinelEvent,
     SpanBeginEvent,
+    SpanEndEvent,
+    StepEvent,
     Timeline,
     TimelineEvent,
     TimelineSpan,
     ToolEvent,
 )
+from inspect_ai.event._pool import condense_model_event_inputs
 from inspect_ai.event._sentinel import SentinelStage
-from inspect_ai.log import EvalLog, EvalSample, read_eval_log
+from inspect_ai.log import (
+    EvalLog,
+    EvalSample,
+    condense_events,
+    read_eval_log,
+    write_eval_log,
+)
 from inspect_ai.log._transcript import transcript
 from inspect_ai.model import (
     ChatCompletionChoice,
@@ -64,20 +84,31 @@ from inspect_ai.model import (
     model_origin,
     modelapi,
 )
-from inspect_ai.model._call_tools import execute_tools
+from inspect_ai.model._call_tools import TOOL_CALLS_FAIL_FAST, execute_tools
 from inspect_ai.model._providers.mockllm import MockLLM
+from inspect_ai.review import Review, Reviewer, ReviewPolicy, reviewer
 from inspect_ai.scorer import Score, Scorer, Target, scorer
 from inspect_ai.solver import Generate, Solver, TaskState, generate, solver, use_tools
 from inspect_ai.tool import (
     Tool,
     ToolCall,
     ToolCallContent,
+    ToolCallError,
     ToolCallView,
+    ToolError,
     ToolInfo,
+    ToolResult,
     tool,
 )
 from inspect_ai.tool._tool import ToolApprovalError, ToolParsingError
-from inspect_ai.util._span import span
+from inspect_ai.util import store
+from inspect_ai.util._span import (
+    current_agent_span_id,
+    current_span_id,
+    in_span,
+    span,
+    span_id_provider,
+)
 
 from .test_sentinel_dispatch import (
     _RetriedError,
@@ -99,7 +130,7 @@ from .test_sentinel_dispatch import (
     d3_reject,
     returns,
 )
-from .test_sentinel_human import Panel, h_ask
+from .test_sentinel_human import Panel, answered, h_ask
 
 if TYPE_CHECKING:
     from inspect_sentinel import (
@@ -217,13 +248,6 @@ def replayed(log: EvalLog, **kwargs: Any) -> list["ReplayStep"]:
     )
 
 
-# the fields whose messages come from the log's pool, which keeps the first id
-# stored for each content: a message sent again under a new id reads back with
-# the first, and equal messages in one history are one row, so one id and one
-# object (a known difference)
-POOLED = {"input", "history"}
-
-
 def comparable(value: Any, ids: bool = True) -> Any:
     """A value as data, with message ids left out unless `ids`."""
     if isinstance(value, BaseModel) and hasattr(value, "role"):
@@ -253,9 +277,10 @@ def assert_replay_equals_live(
     differences: Sequence[str] = (),
     sample: Sample | None = None,
     status: str = "success",
+    inferred: str | None = None,
     **task_kwargs: Any,
 ) -> list["ReplayStep"]:
-    """Run the eval with a probe watching every stage, rebuild its steps from the log, and compare.
+    """Run the eval with a probe watching every stage, rebuild its steps from the log, and compare; then compare those with the steps replayed with the log's origins removed and the turns inferred.
 
     Args:
         solver: The eval's solver.
@@ -264,6 +289,7 @@ def assert_replay_equals_live(
         differences: Fields known to differ, as `"stage.field"`, each a known difference of replay.
         sample: The sample to run.
         status: The status the eval ends with.
+        inferred: Why the steps replayed with the turns inferred differ from those replayed with the recorded origins; None where they are equal.
         **task_kwargs: More `Task` arguments.
     """
     seen: dict[str, Step] = {}
@@ -275,13 +301,16 @@ def assert_replay_equals_live(
     )
     log = eval(task, model=model)[0]
     assert log.status == status, log.error
-    return assert_logged_replay_equals_live(log, seen, differences)
+    return assert_logged_replay_equals_live(log, seen, differences, inferred)
 
 
 def assert_logged_replay_equals_live(
-    log: EvalLog, seen: dict[str, Step], differences: Sequence[str] = ()
+    log: EvalLog,
+    seen: dict[str, Step],
+    differences: Sequence[str] = (),
+    inferred: str | None = None,
 ) -> list["ReplayStep"]:
-    """Rebuild the steps of a log that `r7_probe(seen, copies=True)` watched, and compare."""
+    """Rebuild the steps of a log that `r7_probe(seen, copies=True)` watched, and compare; then compare those with the steps replayed with the log's origins removed and the turns inferred (`inferred` as for `assert_replay_equals_live`)."""
     assert log.samples
     live = live_steps(log.samples[0], seen)
     replay = replayed(log)
@@ -291,25 +320,98 @@ def assert_logged_replay_equals_live(
     assert len(rebuilt) == len(replay)
     assert set(rebuilt) == set(live)
     for key, step in live.items():
-        again = rebuilt[key].step
-        assert type(again) is type(step), key
-        assert rebuilt[key].segment[0] == step.conversation
-        stage = type(step).__name__
-        for f in dataclasses.fields(step):
-            if f.name in ABSENT.get(stage, set()):
-                continue
-            if f"{key[0]}.{f.name}" in differences:
-                continue
-            ours, theirs = getattr(again, f.name), getattr(step, f.name)
-            if f.name == "agent_messages":
-                # the log does not record the agent's own messages
-                assert ours is None, key
-                continue
-            if f.name == "view":
-                ours, theirs = ours.call, theirs.call
-            ids = f.name not in POOLED
-            assert comparable(ours, ids) == comparable(theirs, ids), f"{key} {f.name}"
+        assert_step_equals_live(key, rebuilt[key], step, differences)
+    assert_inferred(log, replay, inferred)
     return replay
+
+
+def assert_step_equals_live(
+    key: tuple[str, str],
+    rebuilt: "ReplayStep",
+    step: Step,
+    differences: Sequence[str] = (),
+) -> None:
+    again = rebuilt.step
+    assert type(again) is type(step), key
+    assert rebuilt.segment[0] == step.conversation
+    stage = type(step).__name__
+    for f in dataclasses.fields(step):
+        if f.name in ABSENT.get(stage, set()):
+            continue
+        if f"{key[0]}.{f.name}" in differences:
+            continue
+        ours, theirs = getattr(again, f.name), getattr(step, f.name)
+        if f.name == "agent_messages":
+            # the log does not record the agent's own messages
+            assert ours is None, key
+            continue
+        if f.name == "view":
+            ours, theirs = ours.call, theirs.call
+        assert comparable(ours) == comparable(theirs), f"{key} {f.name}"
+
+
+class Disagreement(NamedTuple):
+    """How the steps replayed with turns inferred differ from those replayed with the recorded origins."""
+
+    steps: int
+    # (stage, step id) of steps on one side only
+    missing: list[tuple[str, str]]
+    extra: list[tuple[str, str]]
+    # (stage, step id, field) of fields that differ
+    fields: list[tuple[str, str, str]]
+
+
+def without_origins(events: Sequence[Event]) -> list[Event]:
+    def stripped(event: Event) -> Event:
+        if isinstance(event, ModelEvent):
+            return event.model_copy(update={"origin": None})
+        if isinstance(event, ToolEvent) and event.events:
+            return event.model_copy(
+                update={"events": [stripped(e) for e in event.events]}
+            )
+        return event
+
+    return [stripped(event) for event in events]
+
+
+def inferred_disagreement(
+    log: EvalLog, recorded: Sequence["ReplayStep"]
+) -> Disagreement:
+    """Replay the log with every `ModelEvent.origin` removed and compare its steps with `recorded`, field by field."""
+    sample = logged_sample(log)
+    inferred = steps_from_events(
+        sample.messages,
+        without_origins(sample.events),
+        [],
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(log.eval),
+    )
+    ours = {(s.stage, s.id): s for s in inferred}
+    theirs = {(s.stage, s.id): s for s in recorded}
+    fields: list[tuple[str, str, str]] = []
+    for key in sorted(set(ours) & set(theirs)):
+        a, b = ours[key], theirs[key]
+        if a.segment != b.segment:
+            fields.append((*key, "segment"))
+        for f in dataclasses.fields(a.step):
+            if comparable(getattr(a.step, f.name)) != comparable(
+                getattr(b.step, f.name)
+            ):
+                fields.append((*key, f.name))
+    return Disagreement(
+        steps=len(theirs),
+        missing=sorted(set(theirs) - set(ours)),
+        extra=sorted(set(ours) - set(theirs)),
+        fields=fields,
+    )
+
+
+def assert_inferred(
+    log: EvalLog, recorded: Sequence["ReplayStep"], differs: str | None
+) -> None:
+    disagreement = inferred_disagreement(log, recorded)
+    agrees = not (disagreement.missing or disagreement.extra or disagreement.fields)
+    assert agrees == (differs is None), disagreement
 
 
 @solver
@@ -436,6 +538,28 @@ def test_parallel_tool_calls_replay_as_they_ran() -> None:
     )
 
 
+def test_a_messages_tool_steps_share_its_text() -> None:
+    from inspect_ai._util.content import ContentText
+
+    turn = calls(
+        ("addition", {"x": 1, "y": 1}),
+        ("addition", {"x": 2, "y": 2}),
+        ("addition", {"x": 3, "y": 3}),
+    )
+    turn.message.content = [ContentText(text="Adding"), ContentText(text="three.")]
+    log = run_logged([use_tools(addition()), generate()], outputs(turn, done()))
+
+    steps = [
+        replayed.step
+        for replayed in replayed(log)
+        if isinstance(replayed.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert len(steps) == 6
+    assert {step.message for step in steps} == {"Adding\nthree."}
+    # replay keeps every step, so a copy per call grows with calls x text
+    assert len({id(step.message) for step in steps}) == 1
+
+
 def test_a_truncated_result_replays_as_it_ran() -> None:
     replay = assert_replay_equals_live(
         tool_loop(returns("x" * 100)),
@@ -444,6 +568,55 @@ def test_a_truncated_result_replays_as_it_ran() -> None:
     )
     [after] = [step for step in replay if step.stage == "tool_result"]
     assert isinstance(after.step, AfterToolCall) and after.step.truncated
+
+
+def test_a_media_result_moved_out_of_the_tool_message_replays_as_it_ran() -> None:
+    # mockllm takes no images in tool results, so the model's input holds an
+    # edited copy of the tool message under its id
+    image = ContentImage(image="data:image/png;base64,iVBORw0KGgo=")
+    replay = assert_replay_equals_live(
+        tool_loop(returns([ContentText(text="look"), image])),
+        outputs(call("returns"), done()),
+    )
+    [after] = [step for step in replay if step.stage == "tool_result"]
+    assert isinstance(after.step, AfterToolCall)
+    assert image in after.step.result.content
+
+
+@solver
+def clears_the_result() -> Solver:
+    """Run a tool, then clear its result in the conversation under the same id."""
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        model = get_model()
+        tools = [returns("original result")]
+        for turn in range(3):
+            if turn == 2:
+                [index] = [
+                    i
+                    for i, message in enumerate(state.messages)
+                    if isinstance(message, ChatMessageTool)
+                ]
+                state.messages[index] = state.messages[index].model_copy(
+                    update={"content": "[cleared]"}
+                )
+            output = await model.generate(state.messages, tools)
+            state.messages.append(output.message)
+            if output.message.tool_calls:
+                messages, _ = await execute_tools(state.messages, tools)
+                state.messages.extend(messages)
+        return state
+
+    return solve
+
+
+def test_a_result_cleared_later_replays_as_it_ran() -> None:
+    replay = assert_replay_equals_live(
+        clears_the_result(), outputs(call("returns"), done(), done())
+    )
+    [after] = [step for step in replay if step.stage == "tool_result"]
+    assert isinstance(after.step, AfterToolCall)
+    assert after.step.result.text == "original result"
 
 
 def helper(model: Any) -> Agent:
@@ -867,18 +1040,39 @@ def memory_call(path: str) -> ModelOutput:
     return call("memory", command="create", path=path, file_text="x")
 
 
-def test_an_approvers_modified_memory_path_replays_canonical() -> None:
+def test_an_approvers_non_canonical_memory_path_is_refused() -> None:
+    """The log cannot show that the built-in memory tool, not a custom tool of its name, resolved the path."""
     from inspect_ai.tool import memory
 
-    replay = assert_replay_equals_live(
-        tool_loop(memory()),
-        outputs(memory_call("/memories/public/note.txt"), done()),
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=tool_loop(memory()),
         sentinel=[d3_public_memory_only()],
         approval=[
             ApprovalPolicy(
                 d3_memory_path_approver("/memories/public/../secret.txt"), "*"
             )
         ],
+    )
+    log = eval(task, model=outputs(memory_call("/memories/public/note.txt"), done()))[0]
+    assert log.status == "success", log.error
+    tool_event = next(e for e in logged_sample(log).events if isinstance(e, ToolEvent))
+    assert tool_event.arguments["path"] == "/memories/secret.txt"
+    with pytest.raises(
+        ValueError,
+        match=r"approved call does not match the ToolEvent that ran.*Replay this transcript from its messages instead",
+    ):
+        replayed(log)
+
+
+def test_an_approvers_canonical_memory_path_replays() -> None:
+    from inspect_ai.tool import memory
+
+    replay = assert_replay_equals_live(
+        tool_loop(memory()),
+        outputs(memory_call("/memories/public/note.txt"), done()),
+        sentinel=[d3_public_memory_only()],
+        approval=[ApprovalPolicy(d3_memory_path_approver("/memories/secret.txt"), "*")],
     )
     [before] = [step for step in replay if step.stage == "tool_call"]
     assert isinstance(before.step, BeforeToolCall)
@@ -968,8 +1162,604 @@ def test_a_custom_memory_tool_replays_its_path_as_given() -> None:
     ] == [path, path]
 
 
+def test_an_approvers_path_for_a_custom_memory_tool_replays_as_given() -> None:
+    path = "/memories/x/../public/note.txt"
+    replay = assert_replay_equals_live(
+        tool_loop(r7_own_memory()),
+        outputs(memory_call("/memories/public/note.txt"), done()),
+        approval=[ApprovalPolicy(d3_memory_path_approver(path), "*")],
+    )
+    assert [
+        step.step.call.arguments["path"]
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ] == [path, path]
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("version", ["0.3.100", "0.3.300", None])
+def test_an_older_custom_memory_tools_modified_path_is_refused(
+    inputs: str, version: str | None
+) -> None:
+    """Inspect 0.3.276 recorded the proposed path while the custom tool ran the approver's, which canonicalizes to the proposal."""
+    from inspect_ai._sentinel import _replay
+
+    path = Path(__file__).parent / "fixtures" / "custom_memory_modified_0.3.276.json"
+    log = read_eval_log(str(path), resolve_attachments="full")
+    [sample] = log.samples or []
+    approval = next(e for e in sample.events if isinstance(e, ApprovalEvent))
+    tool_event = next(e for e in sample.events if isinstance(e, ToolEvent))
+    assert approval.modified is not None
+    assert approval.modified.arguments == {"path": "/memories/x/../note.txt"}
+    assert tool_event.arguments == {"path": "/memories/note.txt"}
+    assert tool_event.result == "/memories/x/../note.txt"
+    events: list[Event] = list(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    with pytest.raises(
+        ValueError,
+        match=r"approved call does not match the ToolEvent that ran.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            sample.messages,
+            events,
+            pool,
+            sample_uuid=sample.uuid or "sample",
+            eval_info=EvalInfo(version, False),
+        )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("version", ["0.3.276", "0.3.300", None])
+@pytest.mark.parametrize("decision", ["approve", "modify", "escalate"])
+def test_an_older_approval_that_changed_the_call_in_place_is_refused(
+    inputs: str, version: str | None, decision: str
+) -> None:
+    """Inspect 0.3.276 ran the call an approver changed in place, which its ApprovalEvent records and its ToolEvent does not."""
+    from inspect_ai._sentinel import _replay
+
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / f"approval_changed_in_place_{decision}_0.3.276.json"
+    )
+    log = read_eval_log(str(path), resolve_attachments="full")
+    [sample] = log.samples or []
+    approvals = [e for e in sample.events if isinstance(e, ApprovalEvent)]
+    tool_event = next(e for e in sample.events if isinstance(e, ToolEvent))
+    assert [approval.decision for approval in approvals] == (
+        ["escalate", "approve"] if decision == "escalate" else [decision]
+    )
+    assert all(approval.modified is None for approval in approvals)
+    assert approvals[-1].call.arguments == {"path": "/memories/x/../note.txt"}
+    assert tool_event.arguments == {"path": "/memories/note.txt"}
+    assert tool_event.result == "/memories/x/../note.txt"
+    events: list[Event] = list(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    with pytest.raises(
+        ValueError,
+        match=r"approved call does not match the ToolEvent that ran.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            sample.messages,
+            events,
+            pool,
+            sample_uuid=sample.uuid or "sample",
+            eval_info=EvalInfo(version, False),
+        )
+
+
+UNVERIFIED_CALL_WARNING = (
+    "Skipped the tool steps of call(s) {}: each ended in a parsing or approval "
+    "error, and its approved call differs from its ToolEvent, so the log cannot "
+    "show whether or with which arguments it ran."
+)
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("version", ["0.3.276", "0.3.300", None])
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+@pytest.mark.parametrize("error", ["parsing", "approval"])
+def test_an_older_approved_call_that_raised_a_parsing_or_approval_error_is_skipped_with_warning(
+    inputs: str,
+    version: str | None,
+    decision: str,
+    error: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Inspect 0.3.276 ran the approved call, whose tool body raised the error, and its ToolEvent records the proposal."""
+    from inspect_ai._sentinel import _replay
+
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / f"approval_error_{error}_{decision}_0.3.276.json"
+    )
+    log = read_eval_log(str(path), resolve_attachments="full")
+    [sample] = log.samples or []
+    approval = next(e for e in sample.events if isinstance(e, ApprovalEvent))
+    tool_event = next(e for e in sample.events if isinstance(e, ToolEvent))
+    assert approval.decision == decision
+    approved = approval.modified or approval.call
+    assert approved.arguments == {"path": "changed"}
+    assert tool_event.arguments == {"path": "proposed"}
+    assert tool_event.error is not None
+    assert tool_event.error.type == error
+    assert tool_event.error.message == "body ran with changed"
+    events: list[Event] = list(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    replay = steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "sample",
+        eval_info=EvalInfo(version, False),
+    )
+    assert not [step for step in replay if step.stage.startswith("tool")]
+    assert [r.message for r in caplog.records if "Skipped the tool" in r.message] == [
+        UNVERIFIED_CALL_WARNING.format("'c1'")
+    ]
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("version", ["0.3.276", "0.3.300", None])
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+@pytest.mark.parametrize("error", ["parsing", "approval"])
+@pytest.mark.parametrize("successful", ["before", "after"])
+def test_a_skipped_call_does_not_skip_a_successful_call_sharing_its_id(
+    successful: str,
+    inputs: str,
+    version: str | None,
+    decision: str,
+    error: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Inspect 0.3.276 runs a successful call before or after a skipped call `c1`, with id `c1` (`same_*` samples) or another id (`distinct_*` samples)."""
+    from inspect_ai._sentinel import _replay
+
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / f"approval_error_{error}_{decision}_shared_id_0.3.276.json"
+    )
+    log = read_eval_log(str(path), resolve_attachments="full")
+    samples = {sample.id: sample for sample in log.samples or []}
+
+    def replay_tool_steps(ids: str) -> list[tuple[str, dict[str, Any]]]:
+        sample = samples[f"{ids}_{successful}"]
+        tool_events = [e for e in sample.events if isinstance(e, ToolEvent)]
+        other = "c1" if ids == "same" else "c0" if successful == "before" else "c2"
+        layout = [(other, successful), ("c1", "proposed")]
+        if successful == "after":
+            layout.reverse()
+        assert [(e.id, e.arguments["path"]) for e in tool_events] == layout
+        assert [e.error.type if e.error else None for e in tool_events] == [
+            error if path == "proposed" else None for _, path in layout
+        ]
+        events: list[Event] = list(sample.events)
+        pool: list[ChatMessage] = []
+        if inputs == "pooled":
+            events, pool = _replay._condensed(events, [])
+        caplog.clear()
+        replay = steps_from_events(
+            sample.messages,
+            events,
+            pool,
+            sample_uuid=sample.uuid or "sample",
+            eval_info=EvalInfo(version, False),
+        )
+        assert [
+            r.message for r in caplog.records if "Skipped the tool" in r.message
+        ] == [UNVERIFIED_CALL_WARNING.format("'c1'")]
+        return [
+            (step.stage, step.step.call.arguments)
+            for step in replay
+            if isinstance(step.step, BeforeToolCall | AfterToolCall)
+        ]
+
+    expected = [
+        ("tool_call", {"path": successful}),
+        ("tool_result", {"path": successful}),
+    ]
+    assert replay_tool_steps("distinct") == expected
+    assert replay_tool_steps("same") == expected
+
+
+@approver
+def r7_changes_the_call_and_escalates() -> Approver:
+    async def approve(
+        message: str, call: ToolCall, view: ToolCallView, history: list[ChatMessage]
+    ) -> Approval:
+        call.arguments = {"x": 7, "y": 1}
+        return Approval(decision="escalate")
+
+    return approve
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_an_approval_of_a_call_changed_in_place_that_did_not_run_replays(
+    inputs: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Current Inspect refuses to run a call an earlier approver changed in place; the log reads the same as a tool body that raised, so the call's steps are skipped with a warning."""
+    from inspect_ai._sentinel import _replay
+    from inspect_ai.approval import auto_approver
+
+    log = run_logged(
+        tool_loop(addition()),
+        outputs(call("addition", x=1, y=1), done()),
+        approval=[
+            ApprovalPolicy(r7_changes_the_call_and_escalates(), "*"),
+            ApprovalPolicy(auto_approver(), "*"),
+        ],
+    )
+    sample = logged_sample(log)
+    approval = [e for e in sample.events if isinstance(e, ApprovalEvent)][-1]
+    tool_event = next(e for e in sample.events if isinstance(e, ToolEvent))
+    assert approval.decision == "approve"
+    assert approval.call.arguments == {"x": 7, "y": 1}
+    assert tool_event.arguments == {"x": 1, "y": 1}
+    assert tool_event.error is not None and tool_event.error.type == "approval"
+    events: list[Event] = list(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    caplog.clear()
+    replay = steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "sample",
+        eval_info=EvalInfo.from_eval(log.eval),
+    )
+    assert not [step for step in replay if step.stage.startswith("tool")]
+    assert [r.message for r in caplog.records if "Skipped the tool" in r.message] == [
+        UNVERIFIED_CALL_WARNING.format(repr(tool_event.id))
+    ]
+
+
+def test_an_approvers_approve_replays_as_it_ran() -> None:
+    replay = assert_replay_equals_live(
+        tool_loop(addition()),
+        agent_model(),
+        approval=[ApprovalPolicy(d3_approver([], "approve"), "*")],
+    )
+    assert [step.stage for step in replay if step.stage.startswith("tool")] == [
+        "tool_call",
+        "tool_result",
+    ]
+
+
+@monitor
+def r7_runs_an_approved_helper_call(call_id: str) -> MonitorGroup:
+    async def before_call(context: Context, step: BeforeToolCall) -> Observation | None:
+        helper = ToolCall(id=call_id, function="addition", arguments={"x": 9, "y": 1})
+        await execute_tools(
+            [ChatMessageAssistant(content="", tool_calls=[helper])], [addition()]
+        )
+        return None
+
+    return MonitorGroup(before_call)
+
+
+@pytest.mark.parametrize("helper_id", ["shared", "helper"])
+def test_a_monitor_s_approved_call_under_the_agent_s_id_replays(
+    helper_id: str,
+) -> None:
+    # after Ransom's 41st review: an approval inside a sentinel span took the
+    # agent's call's place
+    log = run_logged(
+        tool_loop(addition()),
+        outputs(
+            ModelOutput.for_tool_call(
+                "mockllm/model", "addition", {"x": 1, "y": 1}, tool_call_id="shared"
+            ),
+            done(),
+        ),
+        approval=[ApprovalPolicy(d3_approver([], "approve"), "*")],
+        sentinel=[r7_runs_an_approved_helper_call(helper_id)],
+    )
+    events = logged_sample(log).events
+    approvals = [e for e in events if isinstance(e, ApprovalEvent)]
+    ran = [e for e in events if isinstance(e, ToolEvent)]
+    assert [(a.call.id, a.call.arguments, a.decision) for a in approvals] == [
+        ("shared", {"x": 1, "y": 1}, "approve"),
+        (helper_id, {"x": 9, "y": 1}, "approve"),
+    ]
+    assert [(e.id, e.arguments, e.error) for e in ran] == [
+        (helper_id, {"x": 9, "y": 1}, None),
+        ("shared", {"x": 1, "y": 1}, None),
+    ]
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(log, recorded, inputs)
+            assert [
+                (s.stage, s.id, s.step.call.arguments)
+                for s in replay
+                if isinstance(s.step, BeforeToolCall | AfterToolCall)
+            ] == [
+                ("tool_call", "shared", {"x": 1, "y": 1}),
+                ("tool_result", "shared", {"x": 1, "y": 1}),
+            ], (inputs, recorded is events)
+
+
 @agent
-def r7_runs_a_bridged_host_tool() -> Agent:
+def r7_runs_a_bridged_host_tool(
+    name: str = "mcp__host__addition",
+    approval: list[ApprovalPolicy] | None = None,
+    request_before_running: bool = False,
+    report: bool = False,
+) -> Agent:
+    """A scaffold that declares the host tool as `name` (or calls it through Antigravity's `call_mcp_tool` dispatcher) and runs the call the bridge hands it, after one more model request if `request_before_running`.
+
+    With `report`, it then sends the result in its next request, which is when the bridge checks it.
+    """
+
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+        from inspect_ai.agent._bridge.sandbox.service import call_tool
+        from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
+
+        bridge = SandboxAgentBridge(
+            state=state,
+            filter=None,
+            retry_refusals=None,
+            compaction=None,
+            port=8080,
+            model=None,
+            bridged_tools={"host": {"addition": addition()}},
+            approval=approval,
+        )
+        [served] = bridge.served_tools.values()
+        # the scaffold declares the tool under its own name, with the
+        # description the bridge served
+        declared = (
+            {
+                "name": name,
+                "description": "Call a tool on an MCP server.",
+                "parameters": {"type": "object"},
+            }
+            if name == "call_mcp_tool"
+            else {
+                "name": name,
+                "description": served.description,
+                "parameters": served.parameters.model_dump(exclude_none=True),
+            }
+        )
+        completion = await inspect_completions_api_request(
+            {
+                "model": "inspect",
+                "messages": [{"role": "user", "content": "What is 1 + 1?"}],
+                "tools": [{"type": "function", "function": declared}],
+            },
+            None,
+            bridge,
+        )
+        [proposed] = completion.choices[0].message.tool_calls or []
+        assert proposed.type == "function"
+        if request_before_running:
+            await inspect_completions_api_request(
+                {
+                    "model": "inspect",
+                    "messages": [
+                        {"role": "user", "content": "What is 1 + 1?"},
+                        completion.choices[0].message.model_dump(exclude_none=True),
+                        {"role": "user", "content": "Go ahead."},
+                    ],
+                    "tools": [{"type": "function", "function": declared}],
+                },
+                None,
+                bridge,
+            )
+        arguments = json.loads(proposed.function.arguments)
+        if name == "call_mcp_tool":
+            arguments = arguments["Arguments"]
+        result = await call_tool(bridge)("host", "addition", arguments)
+        if report:
+            await inspect_completions_api_request(
+                {
+                    "model": "inspect",
+                    "messages": [
+                        {"role": "user", "content": "What is 1 + 1?"},
+                        completion.choices[0].message.model_dump(exclude_none=True),
+                        {
+                            "role": "tool",
+                            "tool_call_id": proposed.id,
+                            "content": str(result),
+                        },
+                    ],
+                    "tools": [{"type": "function", "function": declared}],
+                },
+                None,
+                bridge,
+            )
+        return state
+
+    return execute
+
+
+def test_a_bridged_host_tool_calls_steps_are_not_replayed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_runs_a_bridged_host_tool(report=True)),
+        outputs(call("mcp__host__addition", x=1, y=1), done()),
+        sentinel=[r7_probe(seen)],
+    )
+    events = logged_sample(log).events
+    [turn, _] = [e for e in events if isinstance(e, ModelEvent)]
+    [ran] = [e for e in events if isinstance(e, ToolEvent)]
+    # the host tool ran the model's call, as a native call would
+    assert ran.metadata is not None and "bridge" in ran.metadata
+    assert [c.id for c in turn.output.message.tool_calls or []] == [ran.id]
+    assert ran.error is None
+    # live checked the call in the bridge, and its result when the scaffold's
+    # next request carried it
+    live = [e.stage for e in events if isinstance(e, SentinelEvent)]
+    assert live == [
+        "model_input",
+        "model_output",
+        "tool_call",
+        "tool_result",
+        "model_input",
+        "model_output",
+    ]
+    # the log doesn't record which model call made a bridged call, so replay
+    # skips the tool steps, and says so once
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert [step.stage for step in replayed(log)] == [
+            "model_input",
+            "model_output",
+            "model_input",
+            "model_output",
+        ]
+    [warning] = [
+        r.getMessage() for r in caplog.records if "Replay skipped" in r.message
+    ]
+    assert f"({ran.id})" in warning
+
+
+def test_a_native_call_reusing_a_bridged_call_id_keeps_its_tool_steps(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        [
+            as_solver(r7_runs_a_bridged_host_tool(report=True)),
+            use_tools(addition()),
+            generate(),
+        ],
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            done(),
+            r7_tool_calls(
+                ToolCall(id="shared", function="addition", arguments={"x": 5, "y": 5})
+            ),
+            done(),
+        ),
+        sentinel=[r7_probe(seen, copies=True)],
+    )
+    live = [
+        ((e.stage, e.step_id), seen[e.explanation or ""])
+        for e in logged_sample(log).events
+        if isinstance(e, SentinelEvent) and e.path == "r7_probe"
+    ]
+    tools = [
+        (key, step.call.arguments)
+        for key, step in live
+        if isinstance(step, BeforeToolCall | AfterToolCall)
+    ]
+    assert tools == [
+        (("tool_call", "shared"), {"x": 1, "y": 1}),
+        (("tool_result", "shared"), {"x": 1, "y": 1}),
+        (("tool_call", "shared"), {"x": 5, "y": 5}),
+        (("tool_result", "shared"), {"x": 5, "y": 5}),
+    ]
+    # the bridge's checks are marked, so the native call keeps its own
+    replay = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.arguments == {"x": 5, "y": 5}
+    )
+    assert [(stage, args) for stage, _, args in tool_step_calls(replay)] == [
+        ("tool_call", {"x": 5, "y": 5}),
+        ("tool_result", {"x": 5, "y": 5}),
+    ]
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+def test_a_person_s_decision_at_a_skipped_bridge_step_reaches_later_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Panel("approve", "allowed").install(monkeypatch)
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_bridged_scaffold("report")),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="host",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            done(),
+        ),
+        sentinel=[
+            r7_probe(seen, copies=True),
+            h_ask("tool_call", ["approve", "reject"]),
+        ],
+    )
+    live = [
+        seen[e.explanation or ""]
+        for e in logged_sample(log).events
+        if isinstance(e, SentinelEvent)
+        and e.path == "r7_probe"
+        and e.stage.startswith("model")
+    ]
+    replay = replayed(log)
+    assert [s.stage for s in replay] == [
+        "model_input",
+        "model_output",
+        "model_input",
+        "model_output",
+    ]
+    # the person approved the host call, whose steps replay skips; the turns
+    # after it still see the decision
+    assert [len(s.human_decisions or []) for s in live] == [0, 0, 1, 1]
+    for step, rebuilt in zip(live, replay):
+        assert comparable(rebuilt.step.human_decisions) == comparable(
+            step.human_decisions
+        )
+
+
+def r7_tool_calls(*calls: ToolCall) -> ModelOutput:
+    return ModelOutput(
+        model="mockllm/model",
+        choices=[
+            ChatCompletionChoice(
+                message=ChatMessageAssistant(content="", tool_calls=list(calls)),
+                stop_reason="tool_calls",
+            )
+        ],
+    )
+
+
+@monitor
+def r7_waits_for_a_cancel(started: Any) -> MonitorGroup:
+    """Waits at its first tool_result step until it is cancelled."""
+
+    async def after(context: Context, step: AfterToolCall) -> Observation | None:
+        if not started.is_set():
+            started.set()
+            await anyio.sleep_forever()
+        return None
+
+    return MonitorGroup(after)
+
+
+@agent
+def r7_bridged_scaffold(case: str, started: Any = None) -> Agent:
+    """A scaffold whose bridge checks one call's results more than once.
+
+    `report`: a host call's result as the scaffold reports it; `reported_twice`:
+    then sent again as MCP content. `reused_id`: two calls the scaffold runs under one model call id.
+    `reused_by_host`: a call the scaffold runs, then a host call under its id.
+    `retried`: a request whose result check is cancelled, then sent again.
+    """
+
     async def execute(state: AgentState) -> AgentState:
         from inspect_ai.agent._bridge.completions import (
             inspect_completions_api_request,
@@ -987,61 +1777,808 @@ def r7_runs_a_bridged_host_tool() -> Agent:
             bridged_tools={"host": {"addition": addition()}},
         )
         [served] = bridge.served_tools.values()
-        # the scaffold declares the tool under its own name, with the
-        # description the bridge served
-        completion = await inspect_completions_api_request(
+        tools = [
             {
-                "model": "inspect",
-                "messages": [{"role": "user", "content": "What is 1 + 1?"}],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "mcp__host__addition",
-                            "description": served.description,
-                            "parameters": served.parameters.model_dump(
-                                exclude_none=True
-                            ),
-                        },
-                    }
-                ],
+                "type": "function",
+                "function": {
+                    "name": "mcp__host__addition",
+                    "description": served.description,
+                    "parameters": served.parameters.model_dump(exclude_none=True),
+                },
             },
-            None,
-            bridge,
-        )
-        [proposed] = completion.choices[0].message.tool_calls or []
-        assert proposed.type == "function"
-        await call_tool(bridge)(
-            "host", "addition", json.loads(proposed.function.arguments)
-        )
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "Echo the text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                    },
+                },
+            },
+        ]
+        messages: list[Any] = [{"role": "user", "content": "What is 1 + 1?"}]
+
+        async def request() -> Any:
+            completion = await inspect_completions_api_request(
+                {"model": "inspect", "messages": messages, "tools": tools}, None, bridge
+            )
+            message = completion.choices[0].message
+            messages.append(message.model_dump(exclude_none=True))
+            return message.tool_calls or []
+
+        [proposed] = await request()
+        if case in ("report", "reported_twice"):
+            result = await call_tool(bridge)(
+                "host", "addition", json.loads(proposed.function.arguments)
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": proposed.id, "content": str(result)}
+            )
+            await request()
+            if case == "reported_twice":
+                messages[2]["content"] = json.dumps(
+                    [{"type": "text", "text": str(result)}]
+                )
+                await request()
+        elif case == "reused_id":
+            messages.append(
+                {"role": "tool", "tool_call_id": proposed.id, "content": "one"}
+            )
+            [again] = await request()
+            messages.append(
+                {"role": "tool", "tool_call_id": again.id, "content": "two"}
+            )
+            await request()
+        elif case == "reused_by_host":
+            messages.append(
+                {"role": "tool", "tool_call_id": proposed.id, "content": "one"}
+            )
+            [host] = await request()
+            result = await call_tool(bridge)(
+                "host", "addition", json.loads(host.function.arguments)
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": host.id, "content": str(result)}
+            )
+            await request()
+        else:
+            messages.append(
+                {"role": "tool", "tool_call_id": proposed.id, "content": "one"}
+            )
+            with anyio.CancelScope() as scope:
+                async with anyio.create_task_group() as tg:
+
+                    async def cancel() -> None:
+                        await started.wait()
+                        scope.cancel()
+
+                    tg.start_soon(cancel)
+                    await request()
+            # the scaffold sends the same request again
+            await request()
         return state
 
     return execute
 
 
-def test_a_bridged_host_tool_call_has_no_tool_steps() -> None:
-    seen: dict[str, Step] = {}
+@pytest.mark.parametrize(
+    "case", ["reported_twice", "reused_id", "reused_by_host", "retried"]
+)
+def test_a_bridge_checking_one_call_id_more_than_once_replays(case: str) -> None:
+    echo = ToolCall(id="c1", function="echo", arguments={"text": "one"})
+    model = outputs(
+        *(
+            [
+                r7_tool_calls(
+                    replace(
+                        echo, function="mcp__host__addition", arguments={"x": 1, "y": 1}
+                    )
+                )
+            ]
+            if case == "reported_twice"
+            else [r7_tool_calls(echo)]
+        ),
+        *(
+            [r7_tool_calls(replace(echo, arguments={"text": "two"}))]
+            if case == "reused_id"
+            else []
+        ),
+        *(
+            [
+                r7_tool_calls(
+                    replace(
+                        echo, function="mcp__host__addition", arguments={"x": 1, "y": 1}
+                    )
+                )
+            ]
+            if case == "reused_by_host"
+            else []
+        ),
+        done(),
+        *([done()] if case == "reported_twice" else []),
+    )
+    started = anyio.Event()
     log = run_logged(
-        as_solver(r7_runs_a_bridged_host_tool()),
-        outputs(call("mcp__host__addition", x=1, y=1)),
+        as_solver(r7_bridged_scaffold(case, started)),
+        model,
+        sentinel=[
+            r7_probe({}),
+            *([r7_waits_for_a_cancel(started)] if case == "retried" else []),
+        ],
+    )
+    events = [e for e in logged_sample(log).events if isinstance(e, SentinelEvent)]
+    # each check of a step records its events in its own sentinel span
+    checks = list(dict.fromkeys((e.stage, e.step_id, e.span_id) for e in events))
+    tool_checks = [(stage, id) for stage, id, _ in checks if stage.startswith("tool")]
+    if case.startswith("reused"):
+        # a reused id is handed over under a fresh one, so each call's steps
+        # have their own id
+        assert len({id for _, id in tool_checks}) == 2
+    else:
+        # the bridge checked a step under the call id more than once
+        assert len(tool_checks) > len(set(tool_checks))
+    # the bridge's tool steps are not replayed, and the log replays
+    steps = replayed(log)
+    generates = [(stage, id) for stage, id, _ in checks if stage.startswith("model")]
+    assert [(step.stage, step.id) for step in steps] == generates
+
+
+@approver
+def r7_bridged_approver(decision: str) -> Approver:
+    async def approve(
+        message: str, call: ToolCall, view: ToolCallView, history: list[ChatMessage]
+    ) -> Approval:
+        if decision == "modify":
+            return Approval(
+                decision="modify",
+                modified=ToolCall(
+                    id=call.id, function=call.function, arguments={"x": 2, "y": 1}
+                ),
+            )
+        return Approval(decision="approve")
+
+    return approve
+
+
+# the names scaffolds declare a bridged host tool by
+# (tests/agent/test_bridge_approval.py)
+BRIDGED_NAMES = {
+    "bare": "addition",
+    "claude-code": "mcp__host__addition",
+    "gemini-cli": "mcp_host_addition",
+    "gemini-cut": "mcp_" + "s" * 26 + "..." + "s" * 20 + "_addition",
+    "opencode": "host_addition",
+    "codex-hashed": "additio_9f2b038d5e15",
+    "dispatcher": "call_mcp_tool",
+}
+
+
+def bridged_approval_log(name: str, decision: str) -> EvalLog:
+    seen: dict[str, Step] = {}
+    arguments: dict[str, Any] = {"x": 1, "y": 1}
+    proposed = (
+        call(name, ServerName="host", ToolName="addition", Arguments=arguments)
+        if name == "call_mcp_tool"
+        else call(name, **arguments)
+    )
+    return run_logged(
+        as_solver(
+            r7_runs_a_bridged_host_tool(
+                name, [ApprovalPolicy(r7_bridged_approver(decision), "*")]
+            )
+        ),
+        outputs(proposed),
         sentinel=[r7_probe(seen)],
     )
+
+
+def replay_inputs(
+    log: EvalLog, events: Sequence[Event], inputs: str, **kwargs: Any
+) -> list["ReplayStep"]:
+    from inspect_ai._sentinel import _replay
+
+    sample = logged_sample(log)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    return steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(log.eval),
+        **kwargs,
+    )
+
+
+# since #6192 the bridge reviews a call under the host tool's name; before it,
+# under the scaffold's (`test_an_older_bridged_approval_under_the_scaffold_s_name_replays`)
+REVIEWS_AS_HOST_TOOL = hasattr(AgentBridge, "reviewed_calls")
+
+
+def assert_bridged_approval_replays(log: EvalLog, decision: str) -> ToolCall:
+    """Assert the host tool ran the approved call, and replay gives live's steps; return the approved call."""
     events = logged_sample(log).events
-    [turn] = [e for e in events if isinstance(e, ModelEvent)]
+    [approval] = [e for e in events if isinstance(e, ApprovalEvent)]
     [ran] = [e for e in events if isinstance(e, ToolEvent)]
-    # the host tool ran the model's call, as a native call would
-    assert ran.metadata is not None and "bridge" in ran.metadata
-    assert [c.id for c in turn.output.message.tool_calls or []] == [ran.id]
+    approved = approval.modified or approval.call
+    assert approval.decision == decision
+    assert ran.metadata is not None and ran.metadata["bridge"]["grant"] == "consumed"
     assert ran.error is None
-    # the host executor runs no tool stage, so live checked only the generate
+    assert ran.arguments == approved.arguments
+    assert ran.function == "addition"
     live = [e.stage for e in events if isinstance(e, SentinelEvent)]
-    assert live == ["model_input", "model_output"]
-    assert [step.stage for step in replayed(log)] == live
+    # the bridge checks the call it runs (an older log has no such checks), and
+    # replay skips those steps
+    assert live[:2] == ["model_input", "model_output"]
+    assert live[2:] in ([], ["tool_call"])
+    expected = [(step.stage, step.id) for step in replayed(log)]
+    assert [stage for stage, _ in expected] == live[:2]
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(log, recorded, inputs)
+            assert [(step.stage, step.id) for step in replay] == expected
+    return approved
+
+
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+@pytest.mark.parametrize("scaffold", list(BRIDGED_NAMES))
+def test_an_approved_bridged_host_tool_call_replays(
+    scaffold: str, decision: str
+) -> None:
+    name = BRIDGED_NAMES[scaffold]
+    approved = assert_bridged_approval_replays(
+        bridged_approval_log(name, decision), decision
+    )
+    host_name = name == "call_mcp_tool" or REVIEWS_AS_HOST_TOOL
+    assert approved.function == ("addition" if host_name else name)
+
+
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+def test_an_older_bridged_approval_under_the_scaffold_s_name_replays(
+    decision: str,
+) -> None:
+    """Inspect through 0.3.286 recorded a bridged call's approval under the scaffold's name, and the host tool's `ToolEvent` under the tool's."""
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / f"bridged_approval_scaffold_name_{decision}.json"
+    )
+    log = read_eval_log(str(path))
+    approved = assert_bridged_approval_replays(log, decision)
+    assert approved.function == "mcp__host__addition"
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_a_native_tool_event_with_a_bridged_approvals_name_is_refused(
+    inputs: str,
+) -> None:
+    """Without `metadata["bridge"]`, the scaffold's name in the approval is a call the `ToolEvent` does not record."""
+    log = bridged_approval_log("mcp__host__addition", "modify")
+
+    def native(event: Event) -> Event:
+        if isinstance(event, ToolEvent):
+            return event.model_copy(update={"metadata": None})
+        if isinstance(event, ApprovalEvent):
+            assert event.modified is not None
+            name = "mcp__host__addition"
+            return event.model_copy(
+                update={
+                    "call": replace(event.call, function=name),
+                    "modified": replace(event.modified, function=name),
+                }
+            )
+        return event
+
+    events = [native(e) for e in logged_sample(log).events]
+    with pytest.raises(
+        ValueError, match=r"approved call does not match the ToolEvent that ran"
+    ):
+        replay_inputs(log, events, inputs)
+
+
+@pytest.mark.parametrize("tool_event", [True, False])
+def test_a_bridged_approval_reaches_the_requests_before_its_call_runs(
+    tool_event: bool,
+) -> None:
+    """The bridge approves a call when the model proposes it and the scaffold may run it after later requests, so those requests' steps carry the person's decision."""
+    log = run_logged(
+        as_solver(
+            r7_runs_a_bridged_host_tool(
+                approval=[ApprovalPolicy(r7_bridged_approver("approve"), "*")],
+                request_before_running=True,
+            )
+        ),
+        outputs(call("mcp__host__addition", x=1, y=1), done()),
+    )
+    events = logged_sample(log).events
+    [approval] = [e for e in events if isinstance(e, ApprovalEvent)]
+    [ran] = [e for e in events if isinstance(e, ToolEvent)]
+    assert ran.metadata is not None and ran.metadata["bridge"]["grant"] == "consumed"
+    turns = [e for e in events if isinstance(e, ModelEvent)]
+    assert len(turns) == 2
+    assert events.index(approval) < events.index(turns[1]) < events.index(ran)
+    if not tool_event:
+        events = [e for e in events if e is not ran]
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(
+                log, recorded, inputs, human_approvers=(approval.approver,)
+            )
+            assert [(s.stage, s.id) for s in replay] == [
+                (stage, turn.uuid)
+                for turn in turns
+                for stage in ["model_input", "model_output"]
+            ]
+            for step in replay[2:]:
+                decisions = step.step.human_decisions or []
+                assert [(d.step_id, d.decided.report.action) for d in decisions] == [
+                    (approval.call.id, "proceed")
+                ], (inputs, step.stage)
+
+
+class _Overlap:
+    first_waiting: anyio.Event
+    second_proposed: anyio.Event
+
+
+@approver
+def r7_first_approver() -> Approver:
+    async def approve(
+        message: str, call: ToolCall, view: ToolCallView, history: list[ChatMessage]
+    ) -> Approval:
+        _Overlap.first_waiting.set()
+        await _Overlap.second_proposed.wait()
+        return Approval(decision="approve")
+
+    return approve
+
+
+@approver
+def r7_second_approver() -> Approver:
+    async def approve(
+        message: str, call: ToolCall, view: ToolCallView, history: list[ChatMessage]
+    ) -> Approval:
+        _Overlap.second_proposed.set()
+        return Approval(
+            decision="modify",
+            modified=ToolCall(
+                id=call.id, function=call.function, arguments={"x": 2, "y": 1}
+            ),
+        )
+
+    return approve
+
+
+@solver
+def r7_two_bridged_agents_overlap() -> Solver:
+    """The first agent awaits approval of its call while the second proposes its own."""
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        first = r7_runs_a_bridged_host_tool(
+            approval=[ApprovalPolicy(r7_first_approver(), "*")],
+            request_before_running=True,
+        )
+        second = r7_runs_a_bridged_host_tool(
+            approval=[ApprovalPolicy(r7_second_approver(), "*")],
+            request_before_running=True,
+        )
+
+        async def run_first() -> None:
+            await run(first, "What is 1 + 1?")
+
+        async def run_second() -> None:
+            await _Overlap.first_waiting.wait()
+            await run(second, "What is 1 + 1?")
+
+        await tg_collect([run_first, run_second])
+        return state
+
+    return solve
+
+
+@pytest.mark.parametrize("shared_id", [True, False])
+@pytest.mark.parametrize("tool_event", [True, False])
+def test_concurrent_bridged_approvals_reach_their_own_agents(
+    tool_event: bool, shared_id: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    _Overlap.first_waiting = anyio.Event()
+    _Overlap.second_proposed = anyio.Event()
+    proposed = [
+        ModelOutput.for_tool_call(
+            "mockllm/model",
+            tool_name="mcp__host__addition",
+            tool_arguments={"x": 1, "y": 1},
+            tool_call_id="call_0" if shared_id else f"call_{agent}",
+        )
+        for agent in range(2)
+    ]
+    log = run_logged(
+        r7_two_bridged_agents_overlap(),
+        outputs(*proposed, done(), done()),
+    )
+    events = logged_sample(log).events
+    first, second = [e for e in events if isinstance(e, ApprovalEvent)][::-1]
+    assert first.approver == "r7_first_approver"
+    assert (first.call.id == second.call.id) == shared_id
+    turns = [e for e in events if isinstance(e, ModelEvent)]
+    assert len(turns) == 4
+    agents = {turn.uuid: turn.span_id for turn in turns}
+    # the first agent's approval is recorded after the second's proposal
+    assert events.index(turns[1]) < events.index(first)
+    assert [turns[0].span_id, turns[1].span_id] == [first.span_id, second.span_id]
+    ran = [e for e in events if isinstance(e, ToolEvent)]
+    assert len(ran) == 2
+    if not tool_event:
+        events = [e for e in events if e not in ran]
+    expected = {
+        approval.span_id: [(approval.call.id, action)]
+        for approval, action in [(first, "proceed"), (second, "modify")]
+    }
+    approvers = (first.approver, second.approver)
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(log, recorded, inputs, human_approvers=approvers)
+            assert len(replay) == 8
+            for step in replay:
+                decisions = step.step.human_decisions or []
+                assert [(d.step_id, d.decided.report.action) for d in decisions] == (
+                    []
+                    if step.id in (turns[0].uuid, turns[1].uuid)
+                    else expected[agents[step.id]]
+                ), (inputs, step.stage)
+    if not shared_id:
+        return
+    # recorded outside both agents, the first approval is left unpublished
+    outside = [
+        e.model_copy(update={"span_id": None}) if e is first else e for e in events
+    ]
+    replay = replay_inputs(log, outside, "expanded", human_approvers=approvers)
+    for step in replay[4:]:
+        decisions = step.step.human_decisions or []
+        assert [(d.step_id, d.decided.report.action) for d in decisions] == (
+            expected[second.span_id] if agents[step.id] == second.span_id else []
+        )
+    assert "Skipped the human decisions on call(s) 'call_0'" in caplog.text
+
+
+class _Interleave:
+    native_approved: anyio.Event
+    other_approved: anyio.Event
+
+
+@approver
+def r7_other_approver(decision: str = "approve") -> Approver:
+    async def approve(
+        message: str, call: ToolCall, view: ToolCallView, history: list[ChatMessage]
+    ) -> Approval:
+        _Interleave.other_approved.set()
+        return Approval(decision="reject" if decision == "reject" else "approve")
+
+    return approve
+
+
+@monitor
+def r7_holds_the_native_call() -> MonitorGroup:
+    async def before_call(context: Context, step: BeforeToolCall) -> Observation | None:
+        if not _Interleave.native_approved.is_set():
+            _Interleave.native_approved.set()
+            await _Interleave.other_approved.wait()
+        return None
+
+    return MonitorGroup(before_call)
+
+
+@solver
+def r7_native_call_held_across_another_agent(other: str) -> Solver:
+    """A native agent's approved call waits to run while another agent (bridged, or native and refused) proposes and is approved a call with the same id."""
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        native = react(
+            tools=[addition()],
+            approval=[ApprovalPolicy(d3_approver([], "modify", x=2), "*")],
+            submit=False,
+        )
+        second = (
+            r7_runs_a_bridged_host_tool(
+                approval=[ApprovalPolicy(r7_other_approver(), "*")]
+            )
+            if other == "bridge"
+            else react(
+                tools=[addition()],
+                approval=[ApprovalPolicy(r7_other_approver("reject"), "*")],
+                submit=False,
+            )
+        )
+
+        async def run_native() -> None:
+            await run(native, "What is 1 + 1?")
+
+        async def run_other() -> None:
+            await _Interleave.native_approved.wait()
+            await run(second, "What is 1 + 1?")
+
+        await tg_collect([run_native, run_other])
+        return state
+
+    return solve
+
+
+@pytest.mark.parametrize("other", ["bridge", "native"])
+def test_a_native_call_takes_only_its_own_agent_s_approval(other: str) -> None:
+    _Interleave.native_approved = anyio.Event()
+    _Interleave.other_approved = anyio.Event()
+    proposed = [
+        ModelOutput.for_tool_call(
+            "mockllm/model",
+            tool_name=name,
+            tool_arguments={"x": 1, "y": 1},
+            tool_call_id="call_0",
+        )
+        for name in [
+            "addition",
+            "mcp__host__addition" if other == "bridge" else "addition",
+        ]
+    ]
+    log = run_logged(
+        r7_native_call_held_across_another_agent(other),
+        outputs(*proposed, done(), done()),
+        sentinel=[r7_holds_the_native_call()],
+    )
+    events = logged_sample(log).events
+    native_approval, other_approval = [
+        e for e in events if isinstance(e, ApprovalEvent)
+    ]
+    assert native_approval.decision == "modify"
+    assert other_approval.call.id == "call_0"
+    native_turn, other_turn = [e for e in events if isinstance(e, ModelEvent)][:2]
+    [ran] = [
+        e
+        for e in events
+        if isinstance(e, ToolEvent)
+        and not e.error
+        and "bridge" not in (e.metadata or {})
+    ]
+    assert ran.arguments == {"x": 2, "y": 1}
+    # the other agent proposes and is approved the id while the native call waits
+    assert (
+        events.index(native_approval)
+        < events.index(other_turn)
+        < events.index(other_approval)
+        < events.index(ran)
+    )
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(log, recorded, inputs)
+            [generate] = [
+                s
+                for s in replay
+                if s.id == native_turn.uuid and s.stage == "model_input"
+            ]
+            tool_steps = [s for s in replay if s.stage.startswith("tool")]
+            assert [s.stage for s in tool_steps] == ["tool_call", "tool_result"]
+            for replayed_step in tool_steps:
+                step = replayed_step.step
+                assert isinstance(step, BeforeToolCall | AfterToolCall)
+                assert step.conversation == generate.step.conversation
+                assert step.message_id == native_turn.output.message.id
+                assert step.call.arguments == {"x": 2, "y": 1}
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_approvals_of_a_reused_call_id_replay_in_linear_work(
+    inputs: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # after Ransom's 35th review: each approval found its proposal by
+    # rescanning every earlier proposal of its id
+    from inspect_ai._sentinel import _replay
+
+    conversation = _replay._Driver._conversation
+    work: list[int] = []
+
+    def counting_conversation(self: Any, event: Event) -> str:
+        work[-1] += 1
+        return conversation(self, event)
+
+    monkeypatch.setattr(_replay._Driver, "_conversation", counting_conversation)
+    for turns in (100, 200, 400):
+        events: list[Event] = [
+            SpanBeginEvent(id=agent, name=agent, type="agent") for agent in "ab"
+        ]
+        for n in range(turns):
+            agent = "ab"[n % 2]
+            proposed = ToolCall(id="call_0", function="lookup", arguments={"n": n})
+            turn = imported_call(
+                f"model-{n}", [ChatMessageUser(content=f"turn {n}")], agent, proposed
+            )
+            events += [
+                turn.model_copy(update={"origin": "agent"}),
+                ApprovalEvent(
+                    message="",
+                    call=proposed,
+                    approver="auto",
+                    decision="approve",
+                    span_id=agent,
+                ),
+                ToolEvent(
+                    id="call_0",
+                    function="lookup",
+                    arguments={"n": n},
+                    result="found",
+                    metadata={"bridge": "host"},
+                    span_id=agent,
+                ),
+            ]
+        events += [SpanEndEvent(id=agent) for agent in "ab"]
+        events = solving(events)
+        pool: list[ChatMessage] = []
+        if inputs == "pooled":
+            events, pool = _replay._condensed(events, [])
+        work.append(0)
+        replay = steps_from_events(
+            [],
+            events,
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version="0.3.300", sentinel=False),
+            human_approvers=(),
+        )
+        assert len([s for s in replay if s.stage == "model_input"]) == turns
+        assert work[-1] <= 5 * turns, work
+    assert work[-1] <= 4.2 * work[0], work
+
+
+@pytest.mark.parametrize("tool_events", ["none", "bridge", "native"])
+@pytest.mark.parametrize("case", ["shared", "distinct_ids", "separate_spans"])
+def test_a_stored_timeline_s_conversation_owns_its_approval(
+    case: str, tool_events: str
+) -> None:
+    # after Ransom's 36th review: an approval and a ToolEvent took the latest
+    # proposal of their span, though a stored timeline put it in another
+    # conversation
+    from inspect_ai._sentinel import _replay
+
+    spans = {"a": "agent", "b": "other" if case == "separate_spans" else "agent"}
+    ids = {"a": "call_0", "b": "call_1" if case == "distinct_ids" else "call_0"}
+    calls = {c: ToolCall(id=ids[c], function="lookup", arguments={}) for c in "ab"}
+    tasks = {c: ChatMessageUser(content=f"Task {c}.") for c in "ab"}
+    first = {
+        c: linked_call(
+            f"{c}1", spans[c], [tasks[c]], f"Look up {c}.", "agent", calls[c]
+        )
+        for c in "ab"
+    }
+    for c in "ab":
+        first[c].tools = [ToolInfo(name="lookup", description="Find it")]
+    approval = ApprovalEvent(
+        uuid="a-approval",
+        message="",
+        call=calls["a"],
+        approver="human",
+        decision="approve",
+        span_id=spans["a"],
+    )
+    ran = {
+        c: ToolEvent(
+            uuid=f"{c}-tool",
+            id=ids[c],
+            function="lookup",
+            arguments={},
+            result="found",
+            # B's call runs on the host: two native calls of one id are refused
+            metadata=None
+            if tool_events == "native" and c == "a"
+            else {"bridge": "host"},
+            span_id=spans[c],
+        )
+        for c in "ab"
+    }
+    second = {
+        c: linked_call(
+            f"{c}2",
+            spans[c],
+            [
+                tasks[c],
+                first[c].output.message,
+                ChatMessageTool(content="found", tool_call_id=ids[c]),
+            ],
+            "Done.",
+            "agent",
+        )
+        for c in "ab"
+    }
+    running: list[Event] = []
+    if tool_events != "none":
+        for c in "ab":
+            running += [
+                SpanBeginEvent(
+                    id=f"{c}-tool-span",
+                    name="lookup",
+                    type="tool",
+                    parent_id=spans[c],
+                ),
+                ran[c],
+                SpanEndEvent(id=f"{c}-tool-span"),
+            ]
+    agent_spans = sorted(set(spans.values()))
+    events = solving(
+        [
+            *[SpanBeginEvent(id=s, name=s, type="agent") for s in agent_spans],
+            first["a"],
+            first["b"],
+            approval,
+            *running,
+            second["a"],
+            second["b"],
+            *[SpanEndEvent(id=s) for s in agent_spans],
+        ]
+    )
+    in_a: list[Event] = [first["a"], approval, ran["a"], second["a"]]
+    in_b: list[Event] = [first["b"], ran["b"], second["b"]]
+    stored = Timeline(
+        name="target",
+        description="",
+        root=TimelineSpan(
+            id="a",
+            name="a",
+            content=[TimelineEvent(event=e) for e in in_a],
+            branches=[
+                TimelineSpan(
+                    id="b",
+                    name="b",
+                    content=[TimelineEvent(event=e) for e in in_b],
+                )
+            ],
+        ),
+    )
+    tool_ids = {c: ran[c].id for c in "ab"}
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            pool: list[ChatMessage] = []
+            if inputs == "pooled":
+                recorded, pool = _replay._condensed(recorded, [])
+            replay = steps_from_events(
+                [],
+                recorded,
+                pool,
+                sample_uuid="sample",
+                eval_info=EvalInfo(inspect_ai_version="0.3.300", sentinel=False),
+                timeline=stored,
+                human_approvers=("human",),
+            )
+            assert {"a2", "b2"} <= {s.id for s in replay}, (inputs, case)
+            tool_steps = [s for s in replay if s.stage.startswith("tool")]
+            assert len(tool_steps) == (2 if tool_events == "native" else 0)
+            for step in replay:
+                conversation = step.step.conversation
+                decisions = [
+                    (d.step_id, d.decided.report.action)
+                    for d in step.step.human_decisions or []
+                ]
+                if step.stage.startswith("tool"):
+                    assert isinstance(step.step, BeforeToolCall | AfterToolCall)
+                    assert step.step.message_id == (
+                        first[conversation].output.message.id
+                    )
+                    assert step.id == tool_ids[conversation]
+                after_approval = step.id != "a1" and step.stage != "tool_call"
+                assert decisions == (
+                    [("call_0", "proceed")]
+                    if conversation == "a" and after_approval
+                    else []
+                ), (inputs, case, step.stage, step.id)
 
 
 def run_logged(
-    solver: Solver | list[Solver], model: Any, **task_kwargs: Any
+    solver: Solver | list[Solver],
+    model: Any,
+    *,
+    inferred: str | None = None,
+    **task_kwargs: Any,
 ) -> EvalLog:
+    """Run the eval, and check that its steps replayed with the turns inferred are those replayed with the recorded origins, unless `inferred` names why they differ."""
     task = Task(
         dataset=[Sample(input="What is 1 + 1?", target="2")],
         solver=solver,
@@ -1049,6 +2586,7 @@ def run_logged(
     )
     log = eval(task, model=model)[0]
     assert log.status == "success", log.error
+    assert_inferred(log, replay_events(log, logged_sample(log).events), inferred)
     return log
 
 
@@ -1072,6 +2610,52 @@ def replay_events(
     )
 
 
+def assert_replay_skips_bridge_steps(
+    log: EvalLog, seen: dict[str, Step], native: Callable[[Step], bool]
+) -> list["ReplayStep"]:
+    """Rebuild the steps of a log `r7_probe(seen, copies=True)` watched: each equals live, but for the bridge's tool steps (those `native` rejects), which replay skips."""
+    live = [
+        ((e.stage, e.step_id), seen[e.explanation or ""])
+        for e in logged_sample(log).events
+        if isinstance(e, SentinelEvent) and e.path == "r7_probe"
+    ]
+    kept = [
+        (key, step)
+        for key, step in live
+        if not isinstance(step, BeforeToolCall | AfterToolCall) or native(step)
+    ]
+    replay = replayed(log)
+    assert [(s.stage, s.id) for s in replay] == [key for key, _ in kept]
+    for (key, step), rebuilt in zip(kept, replay):
+        assert_step_equals_live(key, rebuilt, step)
+    return replay
+
+
+def tool_step_calls(
+    replay: list["ReplayStep"],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    return [
+        (step.stage, step.step.call.function, step.step.call.arguments)
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+
+
+def replay_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "inspect_ai._sentinel._replay"
+    ]
+
+
+def bridge_warning_ids(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The call ids the replay warning, that an agent bridge checked or ran them, names: each replay of the log warns alike (`run_logged` also replays it with its origins removed)."""
+    [warning] = dict.fromkeys(replay_warnings(caplog))
+    assert "an agent bridge checked or ran" in warning, warning
+    return warning.split("ran (")[1].split(")")[0].split(", ")
+
+
 # a log replay cannot read without guessing fails, naming the rule
 
 
@@ -1081,6 +2665,26 @@ def test_two_steps_of_a_stage_with_one_id_fail_the_replay() -> None:
     tool = next(i for i, e in enumerate(events) if isinstance(e, ToolEvent))
     with pytest.raises(MalformedLogError, match="Two tool_call steps"):
         replay_events(log, [*events[: tool + 1], *events[tool - 1 :]])
+
+
+def test_a_native_check_no_tool_call_matches_is_settled_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    Panel("approve", "allowed").install(monkeypatch)
+    log = run_logged(
+        tool_loop(addition()),
+        agent_model(),
+        sentinel=[h_ask("tool_call", ["approve", "reject"])],
+    )
+    events = logged_sample(log).events
+    [ran] = [e for e in events if isinstance(e, ToolEvent)]
+    replay = replay_events(log, [e for e in events if e is not ran])
+    assert [step.stage for step in replay] == ["model_input", "model_output"] * 2
+    # the person's answer still reaches the next turn
+    [decision] = replay[2].step.human_decisions or []
+    assert decision.step_id == ran.id
+    [warning] = replay_warnings(caplog)
+    assert f"call id(s) {ran.id} that match no tool call" in warning
 
 
 def test_a_span_tree_cycle_fails_the_replay() -> None:
@@ -1101,14 +2705,231 @@ def test_a_span_tree_cycle_no_step_walks_through_fails_the_replay() -> None:
         replay_events(log, [a, b, *events])
 
 
-def test_a_log_without_origins_is_not_replayed_yet() -> None:
-    log = run_logged(tool_loop(addition()), agent_model())
+# react with a summary compaction, run by `inspect eval` with inspect_ai 0.3.285,
+# which records no ModelEvent.origin: the solver and model of
+# test_a_log_from_before_recorded_origins_replays_with_the_timeline_s_turns
+OLD_LOG = Path(__file__).parent / "fixtures" / "react_compaction_0.3.285.json"
+
+
+def react_with_a_summary_compaction() -> tuple[Solver, Any]:
+    from inspect_ai.model._compaction.summary import CompactionSummary
+
+    turns = [call("addition", x=turn, y=turn) for turn in range(6)]
+    solver = as_solver(
+        react(
+            tools=[addition()],
+            compaction=CompactionSummary(threshold=300),
+            submit=False,
+        )
+    )
+    return solver, outputs(*turns, *[done("summary")] * 3, *turns, done())
+
+
+def test_a_log_from_before_recorded_origins_replays_with_the_timeline_s_turns() -> None:
+    old = read_eval_log(str(OLD_LOG), resolve_attachments="full")
+    assert old.eval.packages["inspect_ai"] == "0.3.285"
+    [sample] = old.samples or []
+    models = [e for e in sample.events if isinstance(e, ModelEvent)]
+    assert models and all(e.origin is None for e in models)
+    inferred = steps_from_events(
+        sample.messages,
+        sample.events,
+        sample.events_data["messages"] if sample.events_data else [],
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(old.eval),
+    )
+    # the same eval now, which records origins
+    solver, model = react_with_a_summary_compaction()
+    log = run_logged(solver, model)
+    recorded = replay_events(log, logged_sample(log).events)
+
+    def arguments(step: Step) -> Any:
+        call = getattr(step, "call", None)
+        return call.arguments if call is not None else None
+
+    def shape(steps: Sequence["ReplayStep"]) -> list[Any]:
+        # react's prompts changed since 0.3.285, so compare the messages'
+        # roles, and the steps' tool calls
+        return [
+            (
+                s.stage,
+                s.segment[1],
+                [m.role for m in s.step.history or []],
+                [m.role for m in s.step.input or []],
+                arguments(s.step),
+            )
+            for s in steps
+        ]
+
+    assert shape(inferred) == shape(recorded)
+    # the two summary calls are not turns, so neither has steps
+    generates = {s.id for s in inferred if s.stage == "model_input"}
+    assert len(generates) == len(models) - 2
+    assert max(s.segment[1] for s in inferred) == 2
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "sample_init",
+        "sample_start",
+        "sample_attempt_start",
+        "sample_scoring",
+        "cleanup",
+    ],
+)
+def test_a_model_call_outside_the_phases_is_not_a_turn(where: str) -> None:
+    from inspect_ai._util.registry import _registry
+    from inspect_ai.hooks import Hooks, hooks
+
+    async def call_the_model(*args: Any) -> None:
+        await get_model().generate(where)
+
+    @hooks(name="r7_calls_the_model", description="calls the model from a hook")
+    class CallsTheModel(Hooks):
+        pass
+
+    if where != "cleanup":
+        setattr(CallsTheModel, f"on_{where}", call_the_model)
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=generate(),
+        cleanup=call_the_model if where == "cleanup" else None,
+    )
+    try:
+        log = eval(task, model=outputs(done(), done()))[0]
+    finally:
+        _registry.pop("hooks:r7_calls_the_model", None)
+    assert log.status == "success", log.error
     events = logged_sample(log).events
-    for event in events:
-        if isinstance(event, ModelEvent):
-            event.origin = None
-    with pytest.raises(NotImplementedError, match="origin"):
-        replay_events(log, events)
+    models = [e for e in events if isinstance(e, ModelEvent)]
+    [solve] = [e for e in models if e.origin == "agent"]
+    [outside] = [e for e in models if e is not solve]
+    assert outside.origin == "setup"
+    assert (outside.span_id is None) == (where != "sample_init")
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(log, recorded, inputs)
+            assert [(s.stage, s.id) for s in replay] == [
+                ("model_input", solve.uuid),
+                ("model_output", solve.uuid),
+            ]
+
+
+def test_a_chain_in_cleanup_is_not_an_earlier_layout() -> None:
+    # Ransom's review 31 B1: a chain awaited in Task.cleanup records a
+    # top-level solver span after the solvers and scorers spans close
+    from inspect_ai.solver import chain
+
+    @solver
+    def cleans_up() -> Solver:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            await get_model().generate("cleanup")
+            return state
+
+        return solve
+
+    async def cleanup(state: TaskState) -> None:
+        async def no_generate(*args: Any, **kwargs: Any) -> TaskState:
+            raise AssertionError("cleanup does not generate")
+
+        await chain(cleans_up())(state, no_generate)
+
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=generate(),
+        cleanup=cleanup,
+    )
+    log = eval(task, model=outputs(done(), done()))[0]
+    assert log.status == "success", log.error
+    events = logged_sample(log).events
+    assert any(
+        isinstance(e, SpanBeginEvent) and e.parent_id is None and e.type == "solver"
+        for e in events
+    )
+    models = [e for e in events if isinstance(e, ModelEvent)]
+    [solve] = [e for e in models if e.origin == "agent"]
+    [outside] = [e for e in models if e is not solve]
+    assert outside.origin == "setup"
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(log, recorded, inputs)
+            assert [(s.stage, s.id) for s in replay] == [
+                ("model_input", solve.uuid),
+                ("model_output", solve.uuid),
+            ]
+
+
+@pytest.mark.parametrize("start", ["sample_start", "sample_attempt_start"])
+@pytest.mark.parametrize("after", [False, True])
+def test_a_model_call_before_solving_stops_early_is_not_a_turn(
+    start: str, after: bool
+) -> None:
+    from inspect_ai._util.registry import _registry
+    from inspect_ai.hooks import Hooks, hooks
+    from inspect_ai.util import LimitExceededError
+
+    async def call_and_stop(*args: Any) -> None:
+        await get_model().generate(start)
+        raise LimitExceededError("custom", value=1, limit=1)
+
+    async def call_the_model(*args: Any) -> None:
+        await get_model().generate("after")
+
+    @hooks(name="r7_stops_early", description="calls the model, then stops")
+    class StopsEarly(Hooks):
+        pass
+
+    setattr(StopsEarly, f"on_{start}", call_and_stop)
+    if after:
+        setattr(StopsEarly, "on_sample_scoring", call_the_model)
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=generate(),
+        cleanup=call_the_model if after else None,
+    )
+    try:
+        log = eval(task, model=outputs(done(), done(), done()))[0]
+    finally:
+        _registry.pop("hooks:r7_stops_early", None)
+    assert log.status == "success", log.error
+    events = logged_sample(log).events
+    assert not any(
+        isinstance(e, SpanBeginEvent) and e.name == "solvers" for e in events
+    )
+    models = [e for e in events if isinstance(e, ModelEvent)]
+    assert len(models) == (3 if after else 1)
+    assert all(e.origin == "setup" for e in models)
+    for inputs in ["expanded", "pooled"]:
+        for recorded in [events, without_origins(events)]:
+            replay = replay_inputs(log, recorded, inputs)
+            assert not [s for s in replay if s.stage in ("model_input", "model_output")]
+
+
+@pytest.mark.parametrize("phase", [None, "init", "solvers", "scorers"])
+def test_a_call_outside_the_phases_is_setup_only_in_a_log_that_records_them(
+    phase: str | None,
+) -> None:
+    task: list[ChatMessage] = [ChatMessageUser(content="Solve it.")]
+    m1 = linked_call("m1", None, task, "Solved.", None)
+    events: list[Event] = [m1]
+    if phase is not None:
+        events.extend(
+            [
+                SpanBeginEvent(id=phase, name=phase, type=phase),
+                SpanEndEvent(id=phase),
+            ]
+        )
+    replay = steps_from_events(
+        [*task, m1.output.message],
+        events,
+        [],
+        sample_uuid="sample",
+        eval_info=EvalInfo(inspect_ai_version=None, sentinel=False),
+    )
+    assert [(s.stage, s.id) for s in replay] == (
+        [("model_input", "m1"), ("model_output", "m1")] if phase is None else []
+    )
 
 
 @protocol
@@ -1133,8 +2954,8 @@ def r7_generate_fails() -> Protocol:
     ],
     ids=["terminate", "failure", "protocol-failure"],
 )
-def test_a_model_input_step_no_model_call_followed_is_not_replayed_yet(
-    sentinel: Callable[[], Any], status: str
+def test_a_model_input_check_without_a_model_call_is_skipped_with_warning(
+    sentinel: Callable[[], Any], status: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     task = Task(
         dataset=[Sample(input="What is 1 + 1?", target="2")],
@@ -1147,8 +2968,10 @@ def test_a_model_input_step_no_model_call_followed_is_not_replayed_yet(
     assert not [e for e in events if isinstance(e, ModelEvent)]
     checked = {(e.stage, e.step_id) for e in events if isinstance(e, SentinelEvent)}
     assert [stage for stage, _ in checked] == ["model_input"]
-    with pytest.raises(NotImplementedError, match="model_input step"):
-        replay_events(log, events)
+    assert replay_events(log, events) == []
+    assert [r.message for r in caplog.records if "Skipped" in r.message] == [
+        "Skipped 1 sentinel model check(s) without a matching model call in this transcript."
+    ]
 
 
 @monitor
@@ -1204,7 +3027,7 @@ def r7_generates_again_after_a_failure() -> Solver:
     ids=["later-check-recorded", "later-check-abstains"],
 )
 def test_a_model_input_step_without_its_model_call_is_not_replayed_after_a_later_turn(
-    monitor_fails: Callable[[], Any], recorded: int
+    monitor_fails: Callable[[], Any], recorded: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     task = Task(
         dataset=[Sample(input="What is 1 + 1?", target="2")],
@@ -1223,35 +3046,94 @@ def test_a_model_input_step_without_its_model_call_is_not_replayed_after_a_later
     )
     assert len(called) + 1 == recorded
     assert called in ([turn.uuid], []) and orphan != turn.uuid
-    with pytest.raises(NotImplementedError, match=f"model_input step {orphan!r}"):
-        replay_events(log, events)
-
-
-def test_a_log_with_message_based_generate_ids_keeps_its_recorded_ids() -> None:
-    seen: dict[str, Step] = {}
-    log = run_logged(tool_loop(addition()), agent_model(), sentinel=[r7_probe(seen)])
-    events = logged_sample(log).events
-    # rewrite the generate stages' ids as sentinel 0.1.x recorded them: the
-    # last input message's id before (with ":<n>" when the same input was
-    # checked again, here the second), and the output message's id after
-    turns = [e for e in events if isinstance(e, ModelEvent)]
-    old: dict[str, tuple[str, str]] = {
-        turn.uuid or "": (
-            f"{turn.input[-1].id}{':2' if n else ''}",
-            turn.output.message.id or "",
-        )
-        for n, turn in enumerate(turns)
-    }
-    for event in events:
-        if isinstance(event, SentinelEvent) and event.step_id in old:
-            before, after = old[event.step_id]
-            event.step_id = before if event.stage == "model_input" else after
     replay = replay_events(log, events)
-    assert {(s.stage, s.id) for s in replay if s.stage.startswith("model")} == {
-        (stage, id)
-        for before, after in old.values()
-        for stage, id in (("model_input", before), ("model_output", after))
-    }
+    assert [s.id for s in replay if s.stage == "model_input"] == [turn.uuid]
+    assert [r.message for r in caplog.records if "Skipped" in r.message] == [
+        "Skipped 1 sentinel model check(s) without a matching model call in this transcript."
+    ]
+
+
+def test_unmatched_checks_emit_one_counted_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[Event] = []
+    for index in range(2):
+        span_id = f"check-{index}"
+        events.extend(
+            [
+                SpanBeginEvent(id=span_id, name="probe", type="sentinel"),
+                SentinelEvent(
+                    factory="probe",
+                    path="probe",
+                    function="check",
+                    step_id=f"missing-{index}",
+                    conversation="sample",
+                    stage="model_input" if index == 0 else "model_output",
+                    kind="observation",
+                    status="reported",
+                    suspicion=0.1,
+                    span_id=span_id,
+                ),
+                SpanEndEvent(id=span_id),
+            ]
+        )
+    assert (
+        steps_from_events(
+            [],
+            events,
+            [],
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version=None, sentinel=True),
+        )
+        == []
+    )
+    assert [r.message for r in caplog.records if "Skipped" in r.message] == [
+        "Skipped 2 sentinel model check(s) without a matching model call in this transcript."
+    ]
+
+
+@pytest.mark.parametrize("stage", ["model_input", "model_output"])
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_empty_step_id_check_does_not_attach_to_uuidless_model_call(
+    stage: SentinelStage, inputs: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from inspect_ai._sentinel import _replay
+
+    check = SentinelEvent(
+        factory="inspect_sentinel/human",
+        path="human",
+        function="check",
+        step_id="",
+        conversation="sample",
+        stage=stage,
+        kind="decision",
+        status="reported",
+        action="proceed",
+        span_id="check",
+    )
+    call = imported_call("unused", [ChatMessageUser(content="Go ahead")], "run")
+    call = call.model_copy(update={"uuid": None, "origin": "agent"})
+    events: list[Event] = [
+        SpanBeginEvent(id="check", name="human", type="sentinel"),
+        check,
+        SpanEndEvent(id="check"),
+        call,
+    ]
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    replay = steps_from_events(
+        [],
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=True),
+    )
+    [step] = [s for s in replay if s.stage == stage]
+    assert step.recorded_answers == {}
+    assert [r.message for r in caplog.records if "Skipped" in r.message] == [
+        "Skipped 1 sentinel model check(s) without a matching model call in this transcript."
+    ]
 
 
 @solver
@@ -1302,6 +3184,353 @@ def test_a_stored_timeline_gives_one_conversation_per_branch() -> None:
     ] == ["target", "rollback"]
 
 
+def solving(events: list[Event]) -> list[Event]:
+    for event in events:
+        if isinstance(event, SpanBeginEvent):
+            if event.parent_id is None:
+                event.parent_id = "solvers"
+        elif not isinstance(event, SpanEndEvent) and event.span_id is None:
+            event.span_id = "solvers"
+    return [
+        SpanBeginEvent(id="solvers", name="solvers", type="solvers"),
+        *events,
+        SpanEndEvent(id="solvers"),
+    ]
+
+
+def test_a_stored_timeline_does_not_change_turn_inference_without_origins() -> None:
+    task = ChatMessageUser(content="Solve it.")
+    m1 = linked_call("m1", "agent", [task], "First.", None)
+    asked: list[ChatMessage] = [
+        task,
+        m1.output.message,
+        ChatMessageUser(content="Next?"),
+    ]
+    m2 = linked_call("m2", "agent", asked, "Alternative A.", None)
+    m3 = linked_call("m3", "agent", asked, "Alternative B.", None)
+    m4 = linked_call(
+        "m4",
+        "agent",
+        [*asked, m3.output.message, ChatMessageUser(content="Continue.")],
+        "Done.",
+        None,
+    )
+    events = solving(
+        [
+            SpanBeginEvent(id="agent", name="agent", type="agent"),
+            m1,
+            m2,
+            m3,
+            m4,
+            SpanEndEvent(id="agent"),
+        ]
+    )
+    stored = Timeline(
+        name="target",
+        description="",
+        root=TimelineSpan(
+            id="target",
+            name="target",
+            content=[TimelineEvent(event=m1), TimelineEvent(event=m2)],
+            branches=[
+                TimelineSpan(
+                    id="rollback",
+                    name="rollback",
+                    content=[TimelineEvent(event=m3), TimelineEvent(event=m4)],
+                )
+            ],
+        ),
+    )
+    replay = steps_from_events(
+        [],
+        events,
+        [],
+        sample_uuid="sample",
+        eval_info=EvalInfo(inspect_ai_version=None, sentinel=False),
+        timeline=stored,
+    )
+    turns = [step for step in replay if step.stage == "model_input"]
+    assert [step.id for step in turns] == ["m1", "m3", "m4"]
+    assert [step.step.conversation for step in turns] == [
+        "target",
+        "rollback",
+        "rollback",
+    ]
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_a_solver_wrapping_a_subagent_keeps_its_agent_s_continuity(
+    inputs: str,
+) -> None:
+    # Ransom's 39th review: the timeline keeps a solver that holds a subagent
+    # as a span of its own, but the solver's own calls are still its agent's
+    from inspect_ai._sentinel import _replay
+
+    task = ChatMessageUser(content="Solve it.")
+    m1 = linked_call("m1", "agent", [task], "First.", None)
+    asked: list[ChatMessage] = [
+        task,
+        m1.output.message,
+        ChatMessageUser(content="Next?"),
+    ]
+    m2 = linked_call("m2", "agent", asked, "Alternative A.", None)
+    m3 = linked_call("m3", "agent", asked, "Alternative B.", None)
+    s1 = linked_call("s1", "sub", [ChatMessageUser(content="Help.")], "Helped.", None)
+    m4 = linked_call(
+        "m4",
+        "wrap",
+        [*asked, m3.output.message, ChatMessageUser(content="Continue.")],
+        "Done.",
+        None,
+    )
+    events = solving(
+        [
+            SpanBeginEvent(id="agent", name="agent", type="agent"),
+            m1,
+            m2,
+            m3,
+            SpanBeginEvent(id="wrap", name="wrap", type="solver", parent_id="agent"),
+            SpanBeginEvent(id="sub", name="sub", type="agent", parent_id="wrap"),
+            s1,
+            SpanEndEvent(id="sub"),
+            m4,
+            SpanEndEvent(id="wrap"),
+            SpanEndEvent(id="agent"),
+        ]
+    )
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    replay = steps_from_events(
+        [],
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo(inspect_ai_version=None, sentinel=False),
+    )
+
+    assert [
+        s.id
+        for s in replay
+        if s.stage == "model_input" and s.step.conversation == "agent"
+    ] == ["m1", "m3", "m4"]
+
+
+# the shared continuity fixtures, whose "expected_continuity" (else
+# "expected") gives the turns replay's log driver infers
+CONTINUITY_FIXTURES = Path(__file__).parent.parent / "timeline" / "fixtures" / "events"
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    sorted(
+        path.stem
+        for path in CONTINUITY_FIXTURES.glob("*.json")
+        if path.stem.startswith(("continuity_", "agent_result_"))
+    ),
+)
+def test_replay_infers_the_turns_of_the_continuity_fixtures(fixture: str) -> None:
+    # continuity applies only in replay's log driver (decided by Charles
+    # 2026-10-26): a log without origins replays as one recording, for the
+    # main agent's calls, the origins its continuity tree shows
+    import json
+
+    from pydantic import TypeAdapter
+
+    data = json.loads((CONTINUITY_FIXTURES / f"{fixture}.json").read_text())
+    events = TypeAdapter(list[Event]).validate_python(data["events"])
+    main = data.get("expected_continuity", data["expected"])["agent"]
+    turns = set(main["event_uuids"])
+    utility = {
+        uuid
+        for child in main.get("children", [])
+        if child.get("utility")
+        for uuid in child["event_uuids"]
+    }
+    recorded = [
+        event.model_copy(
+            update={"origin": "agent" if event.uuid in turns else "helper"}
+        )
+        if isinstance(event, ModelEvent) and event.uuid in turns | utility
+        else event
+        for event in events
+    ]
+
+    def steps(events: list[Event]) -> list[Any]:
+        return [
+            (s.stage, s.id, s.segment, comparable(s.step))
+            for s in steps_from_events(
+                [],
+                events,
+                [],
+                sample_uuid="sample",
+                eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=False),
+            )
+        ]
+
+    assert steps(events) == steps(recorded)
+
+
+@pytest.mark.parametrize("phases", [True, False])
+def test_a_solver_s_call_after_the_only_agent_is_not_judged_by_its_prompt(
+    phases: bool,
+) -> None:
+    # self-review after Ransom's ninth review: the timeline merges a solver's
+    # calls beside the only agent span into that span, and the prompt rule
+    # took the agent's tool-calling prompt as theirs, so a final generate()
+    # under the solver's own prompt was utility; continuity keeps the two
+    # conversations apart, and so now does the prompt rule
+    checker = ChatMessageSystem(content="You check.")
+    asked: list[ChatMessage] = [checker, ChatMessageUser(content="Check it.")]
+    call = ToolCall(id="t1", function="f", arguments={})
+    b1 = linked_call("B1", "B", asked, "", None, call)
+    result = ChatMessageTool(content="ok", tool_call_id="t1", function="f")
+    b2 = linked_call("B2", "B", [*asked, b1.output.message, result], "Fine.", None)
+    final: list[ChatMessage] = [
+        ChatMessageSystem(content="You are the main solver."),
+        ChatMessageUser(content="Solve it."),
+    ]
+    m1 = linked_call("M1", "solvers" if phases else None, final, "Solved.", None)
+    events: list[Event] = [
+        SpanBeginEvent(id="B", name="checker", type="agent", parent_id="solvers"),
+        b1,
+        b2,
+        SpanEndEvent(id="B"),
+        m1,
+    ]
+    if phases:
+        events = [
+            SpanBeginEvent(id="solvers", name="solvers", type="solvers"),
+            *events,
+            SpanEndEvent(id="solvers"),
+        ]
+    else:
+        events[0] = SpanBeginEvent(id="B", name="checker", type="agent")
+
+    def steps(events: list[Event]) -> list[tuple[str, str]]:
+        return sorted(
+            (s.stage, s.id)
+            for s in steps_from_events(
+                [*final, m1.output.message],
+                events,
+                [],
+                sample_uuid="sample",
+                eval_info=EvalInfo(inspect_ai_version=None, sentinel=False),
+            )
+        )
+
+    recorded = [
+        e.model_copy(update={"origin": "agent"}) if isinstance(e, ModelEvent) else e
+        for e in events
+    ]
+
+    assert steps(events) == steps(recorded)
+    assert ("model_input", "M1") in steps(events)
+
+
+def checked_m3(later_turn: bool, recorded: bool) -> list[Event]:
+    """`continuity_none` with a sentinel check of m3, a call inferred as utility unless its origin is recorded."""
+    import json
+
+    from pydantic import TypeAdapter
+
+    data = json.loads((CONTINUITY_FIXTURES / "continuity_none.json").read_text())
+    events: list[Event] = []
+    for event in TypeAdapter(list[Event]).validate_python(data["events"]):
+        if isinstance(event, ModelEvent):
+            if event.uuid == "m4" and not later_turn:
+                continue
+            if recorded:
+                event = event.model_copy(update={"origin": "agent"})
+        if isinstance(event, ModelEvent) and event.uuid == "m3":
+            last = event.input[-1].model_copy(update={"id": "u3"})
+            event = event.model_copy(update={"input": [*event.input[:-1], last]})
+            events += [
+                SpanBeginEvent(
+                    id="check", name="probe", type="sentinel", span_id=event.span_id
+                ),
+                SentinelEvent(
+                    factory="probe",
+                    path="probe",
+                    function="check",
+                    step_id="m3",
+                    conversation="agent",
+                    stage="model_input",
+                    kind="observation",
+                    status="reported",
+                    suspicion=0.1,
+                    span_id="check",
+                ),
+                SpanEndEvent(id="check", span_id=event.span_id),
+            ]
+        events.append(event)
+    return events
+
+
+@pytest.mark.parametrize("later_turn", [True, False])
+def test_a_checked_call_inferred_not_a_turn_has_no_steps(
+    later_turn: bool,
+) -> None:
+    # A checked call inferred as utility has no step. The next turn keeps its
+    # own id and is not handed that check.
+    replay = steps_from_events(
+        [],
+        checked_m3(later_turn, recorded=False),
+        [],
+        sample_uuid="sample",
+        eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=True),
+    )
+
+    assert [s.id for s in replay if s.stage == "model_input"] == [
+        "m1",
+        "m2",
+        *(["m4"] if later_turn else []),
+    ]
+
+
+@pytest.mark.parametrize("later_turn", [True, False])
+def test_a_checked_call_recorded_as_a_turn_keeps_its_check(
+    later_turn: bool,
+) -> None:
+    replay = steps_from_events(
+        [],
+        checked_m3(later_turn, recorded=True),
+        [],
+        sample_uuid="sample",
+        eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=True),
+    )
+
+    assert [s.id for s in replay if s.stage == "model_input"] == [
+        "m1",
+        "m2",
+        "m3",
+        *(["m4"] if later_turn else []),
+    ]
+
+
+def test_a_main_conversation_ending_in_a_fork_replays_both_heads() -> None:
+    import json
+
+    from pydantic import TypeAdapter
+
+    data = json.loads((CONTINUITY_FIXTURES / "continuity_fork_at_end.json").read_text())
+    events = TypeAdapter(list[Event]).validate_python(data["events"])
+    m2 = next(e for e in events if isinstance(e, ModelEvent) and e.uuid == "m2")
+    replay = steps_from_events(
+        [*m2.input, m2.output.message],
+        events,
+        [],
+        sample_uuid="sample",
+        eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=False),
+    )
+
+    assert [s.id for s in replay if s.stage == "model_input"] == [
+        "m1",
+        "m2",
+        "m3",
+    ]
+
+
 def test_a_person_s_approval_is_a_human_decision_without_a_sentinel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1319,7 +3548,7 @@ def test_a_person_s_approval_is_a_human_decision_without_a_sentinel(
         sample.events,
         [],
         sample_uuid=sample.uuid or "",
-        eval_info=EvalInfo(inspect_ai_version=None, sentinel=False),
+        eval_info=EvalInfo.from_eval(log.eval),
         human_approvers=("human",),
     )
     first, second = [s for s in replay if s.stage == "tool_call"]
@@ -1510,7 +3739,7 @@ def replay_work(
 
 
 def assert_linear(small: Work, large: Work, doubles: bool = True) -> None:
-    """Each pool row is keyed once, and the fold's work (comparisons, bisections and index entries) is within a constant of what the log stores; with `doubles`, twice the turns cost at most a little over twice the work."""
+    """For these stored input shapes, each pool row is keyed once and the fold's work stays within a constant of stored rows and ranges; with `doubles`, twice the turns cost at most a little over twice the work."""
     for work in (small, large):
         assert work.keyed <= work.pool
         # a few comparisons, bisections and index entries per stored row and range
@@ -1523,12 +3752,13 @@ def assert_linear(small: Work, large: Work, doubles: bool = True) -> None:
         assert large.entries <= 2.2 * small.entries + 10, (small, large)
 
 
-def log_work(turns: int, monkeypatch: pytest.MonkeyPatch) -> Work:
+def log_work(turns: int, monkeypatch: pytest.MonkeyPatch, origins: bool = True) -> Work:
     from inspect_ai._sentinel import _replay
 
     log = long_run(turns)
     sample = logged_sample(log)
-    events, pool = _replay._condensed(sample.events, [])
+    events = sample.events if origins else without_origins(sample.events)
+    events, pool = _replay._condensed(events, [])
     return replay_work(
         monkeypatch,
         sample.messages,
@@ -1539,10 +3769,393 @@ def log_work(turns: int, monkeypatch: pytest.MonkeyPatch) -> Work:
     )
 
 
-def test_replay_reads_each_pool_row_once_and_folds_linearly(
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_an_adversarial_log_replays_in_linear_work(inputs: str) -> None:
+    # after Ransom's ninth review: repeated tool call ids, an unresolved
+    # bridge task, fragmented and falling inputs, unresolved forks and
+    # sentinel 0.1.x checks named by message id (repeat suffixes included)
+    # at once; the lines of inspect_ai executed per unit the log stores stay
+    # flat as the rounds double for these input shapes
+    from test_helpers.adversarial_log import adversarial_log, executed_lines
+
+    pooled = inputs == "pooled"
+    per_unit = []
+    for rounds in (100, 200, 400):
+        log = adversarial_log(rounds, window=None if pooled else 16, checks=True)
+        events: list[Event] = log.events
+        pool: list[ChatMessage] = []
+        if pooled:
+            events, _, entries = condense_model_event_inputs(events, 0, {})
+            pool = [message for _, message in entries]
+        stored = len(events) + len(pool)
+        for e in events:
+            if isinstance(e, ModelEvent):
+                stored += len(e.input_refs) if pooled and e.input_refs else len(e.input)
+        replay, lines = executed_lines(
+            steps_from_events,
+            log.messages,
+            events,
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=True),
+        )
+        assert len([s for s in replay if s.stage == "model_input"]) >= rounds
+        per_unit.append(lines / stored)
+    assert per_unit[2] <= 1.3 * per_unit[0], per_unit
+
+
+def test_tool_call_prompt_scan_without_system_message_is_linear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert_linear(log_work(20, monkeypatch), log_work(40, monkeypatch))
+    from inspect_ai.event import _timeline
+
+    original = _timeline._get_system_prompt_for_event
+    work: list[int] = []
+
+    def count_prompt_input(event: ModelEvent, inputs: Any) -> str | None:
+        work[-1] += len(inputs.of(event))
+        return original(event, inputs)
+
+    monkeypatch.setattr(_timeline, "_get_system_prompt_for_event", count_prompt_input)
+    for turns in (100, 200, 400):
+        pool: list[ChatMessage] = [
+            ChatMessageUser(content=f"message {n}") for n in range(turns)
+        ]
+        events: list[Event] = [SpanBeginEvent(id="run", name="run", type="agent")]
+        for n in range(turns):
+            call = ToolCall(id=f"tool-{n}", function="lookup", arguments={})
+            event = imported_call(f"model-{n}", [], "run", call)
+            events.append(event.model_copy(update={"input_refs": [(0, n + 1)]}))
+        events.append(SpanEndEvent(id="run"))
+        work.append(0)
+        replay = steps_from_events(
+            [],
+            solving(events),
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=False),
+        )
+        assert len([s for s in replay if s.stage == "model_input"]) == turns
+        assert work[-1] <= 2 * len(pool), work
+    assert work[-1] <= 4.2 * work[0], work
+
+
+def test_pooled_prompt_fallback_without_system_message_reads_pool_once() -> None:
+    from inspect_ai.event import _timeline
+
+    class CountingPool(list[ChatMessage]):
+        reads = 0
+
+        def __getitem__(self, index: Any) -> Any:
+            self.reads += 1
+            return super().__getitem__(index)
+
+        def __iter__(self) -> Iterator[ChatMessage]:
+            for message in super().__iter__():
+                self.reads += 1
+                yield message
+
+    work: list[int] = []
+    for size in (100, 200, 400):
+        pool = CountingPool(
+            ChatMessageUser(content=f"message {n}") for n in range(size)
+        )
+        events = [turn_event([], [(0, n + 1)]) for n in range(size)]
+        inputs = _timeline._Inputs(events, pool)
+        for event in events:
+            assert _timeline._get_system_prompt_for_event(event, inputs) is None
+        work.append(pool.reads)
+        assert work[-1] <= 3 * len(pool), work
+    assert work[-1] <= 4.2 * work[0], work
+
+
+@pytest.mark.parametrize("setup", [False, True])
+@pytest.mark.parametrize("empty", [True, False])
+@pytest.mark.parametrize("delayed", [False, True])
+@pytest.mark.parametrize("ordinary", [False, True])
+def test_bridge_result_lookup_with_empty_results_stays_bounded(
+    empty: bool,
+    setup: bool,
+    delayed: bool,
+    ordinary: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inspect_ai.event import _timeline
+
+    original = _timeline._Inputs._pool_tool_rows
+    original_results = _timeline._Inputs.tool_results
+    original_row = _timeline._Inputs.row
+    work: list[int] = []
+    final_results: list[tuple[str, str]] = []
+    active_lookup = False
+
+    class CountingRows(dict[str, list[int]]):
+        def get(self, key: str, default: Any = None) -> Any:
+            work[-1] += 1
+            return super().get(key, default)
+
+    def counted_rows(inputs: Any) -> dict[str, list[int]]:
+        rows = original(inputs)
+        if not isinstance(rows, CountingRows):
+            rows = CountingRows(rows)
+            inputs._tool_rows = rows
+        return rows
+
+    def counted_results(
+        inputs: Any, event: ModelEvent, ids: Any
+    ) -> list[tuple[str, str]]:
+        nonlocal active_lookup
+        active_lookup = True
+        try:
+            results = original_results(inputs, event, ids)
+        finally:
+            active_lookup = False
+        if event.uuid == "last":
+            final_results.extend(results)
+        return results
+
+    def counted_row(inputs: Any, row: int) -> ChatMessage:
+        if active_lookup:
+            work[-1] += 1
+        return original_row(inputs, row)
+
+    monkeypatch.setattr(_timeline._Inputs, "_pool_tool_rows", counted_rows)
+    monkeypatch.setattr(_timeline._Inputs, "tool_results", counted_results)
+    monkeypatch.setattr(_timeline._Inputs, "row", counted_row)
+    for rounds in (100, 200, 400):
+        final_results.clear()
+        pool: list[ChatMessage] = [ChatMessageUser(content="Start")]
+        delayed_results: list[ChatMessageTool] = []
+        events: list[Event] = []
+        if setup:
+            events.extend(
+                [
+                    SpanBeginEvent(id="init", name="init", type="init"),
+                    linked_call("setup", "init", [], "Ready", None),
+                    SpanEndEvent(id="init"),
+                ]
+            )
+        events.extend(
+            [
+                SpanBeginEvent(id="solvers", name="solvers", type="solvers"),
+                SpanBeginEvent(
+                    id="main", name="main", type="agent", parent_id="solvers"
+                ),
+            ]
+        )
+        for n in range(rounds):
+            task = ToolCall(id=f"task-{n}", function="task", arguments={})
+            call = linked_call(f"m{n}", "main", [], "", None, task)
+            events.append(call.model_copy(update={"input_refs": [(0, len(pool))]}))
+            pool.append(call.output.message)
+            sub = f"agent-{task.id}"
+            events.extend(
+                [
+                    SpanBeginEvent(id=sub, name="sub", type="agent", parent_id="main"),
+                    linked_call(f"sub-{n}", sub, [], "done", None).model_copy(
+                        update={"input_refs": [(0, 1)]}
+                    ),
+                    SpanEndEvent(id=sub),
+                ]
+            )
+            result = ChatMessageTool(
+                content="" if empty else f"result {n}",
+                tool_call_id=task.id,
+                function="task",
+            )
+            if delayed:
+                delayed_results.append(result)
+            else:
+                pool.append(result)
+            if ordinary:
+                pool.append(
+                    ChatMessageTool(
+                        content=f"ordinary result {n}",
+                        tool_call_id=f"ordinary-{n}",
+                        function="ordinary",
+                    )
+                )
+        pool.extend(delayed_results)
+        events.append(
+            linked_call("last", "main", [], "Done", None).model_copy(
+                update={"input_refs": [(0, len(pool))]}
+            )
+        )
+        events.append(SpanEndEvent(id="main"))
+        events.append(SpanEndEvent(id="solvers"))
+        work.append(0)
+        replay = steps_from_events(
+            [],
+            events,
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=False),
+        )
+        assert replay
+        assert dict(final_results) == (
+            {f"task-{n}": f"result {n}" for n in range(rounds)}
+            if delayed and not empty
+            else ({f"task-{rounds - 1}": f"result {rounds - 1}"} if not empty else {})
+        )
+        assert work[-1] <= 4 * rounds, (rounds, work)
+    assert work[-1] <= 4.2 * work[0] + 10, work
+
+
+def test_bridge_result_lookup_for_agent_batch_over_fragmented_input_stays_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inspect_ai.event import _timeline
+
+    original_results = _timeline._Inputs.tool_results
+    original_row = _timeline._Inputs.row
+    original_bisect = bisect.bisect_left
+    work: list[int] = []
+    final_results: list[tuple[str, str]] = []
+    active_lookup = False
+
+    def counted_results(
+        inputs: Any, event: ModelEvent, ids: Any
+    ) -> list[tuple[str, str]]:
+        nonlocal active_lookup
+        active_lookup = True
+        try:
+            results = original_results(inputs, event, ids)
+        finally:
+            active_lookup = False
+        if event.uuid == "final":
+            final_results.extend(results)
+        return results
+
+    def counted_row(inputs: Any, row: int) -> ChatMessage:
+        if active_lookup:
+            work[-1] += 1
+        return original_row(inputs, row)
+
+    def counted_bisect(*args: Any, **kwargs: Any) -> int:
+        if active_lookup:
+            work[-1] += 1
+        return original_bisect(*args, **kwargs)
+
+    def agent(call_id: str) -> list[Event]:
+        span = f"agent-{call_id}"
+        return [
+            SpanBeginEvent(id=span, name="task", type="agent", parent_id="main"),
+            linked_call(
+                f"sub-{call_id}", span, [ChatMessageUser(content=call_id)], "", None
+            ),
+            SpanEndEvent(id=span),
+        ]
+
+    monkeypatch.setattr(_timeline._Inputs, "tool_results", counted_results)
+    monkeypatch.setattr(_timeline._Inputs, "row", counted_row)
+    monkeypatch.setattr(_timeline, "bisect_left", counted_bisect)
+    for agents in (100, 200, 400):
+        final_results.clear()
+        # the parent keeps every other setup message, so its inputs are stored
+        # as many disjoint pool ranges
+        setup: list[ChatMessage] = [
+            ChatMessageUser(content=f"note {n}") for n in range(2 * agents)
+        ]
+        seed = ToolCall(id="seed", function="task", arguments={})
+        first = linked_call("first", "main", setup[::2], "", None, seed)
+        history = [*setup[::2], first.output.message]
+        tasks = [
+            ToolCall(id=f"task-{n}", function="task", arguments={})
+            for n in range(agents)
+        ]
+        fanout = linked_call("fanout", "main", history, "", None, *tasks)
+        history.append(fanout.output.message)
+        waiting = linked_call("waiting", "main", history, "", None)
+        results = [
+            ChatMessageTool(content=f"result {call.id}", tool_call_id=call.id)
+            for call in [seed, *tasks]
+        ]
+        final = linked_call(
+            "final", "main", [*history, waiting.output.message, *results], "", None
+        )
+        events: list[Event] = [
+            SpanBeginEvent(id="init", name="init", type="init"),
+            linked_call("setup", "init", setup, "", None),
+            SpanEndEvent(id="init"),
+            SpanBeginEvent(id="solvers", name="solvers", type="solvers"),
+            SpanBeginEvent(id="main", name="main", type="agent", parent_id="solvers"),
+            first,
+            *agent("seed"),
+            fanout,
+            *[event for call in tasks for event in agent(call.id)],
+            waiting,
+            final,
+            SpanEndEvent(id="main"),
+            SpanEndEvent(id="solvers"),
+        ]
+        events, data = condense_events(events)
+        event_adapter = TypeAdapter(list[Event])
+        message_adapter = TypeAdapter(list[ChatMessage])
+        events = event_adapter.validate_json(event_adapter.dump_json(events))
+        pool = message_adapter.validate_json(
+            message_adapter.dump_json(data["messages"])
+        )
+        [stored] = [
+            event
+            for event in events
+            if isinstance(event, ModelEvent) and event.uuid == "waiting"
+        ]
+        assert len(stored.input_refs or []) > agents
+        work.append(0)
+        replay = steps_from_events(
+            [],
+            events,
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version="0.3.277", sentinel=False),
+        )
+        assert replay
+        assert dict(final_results) == {
+            call.id: f"result {call.id}" for call in [seed, *tasks]
+        }
+        assert work[-1] <= 4 * len(pool), (agents, work)
+    assert work[-1] <= 4.2 * work[0] + 10, work
+
+
+def test_summary_match_reads_linearly_with_retained_prefix_and_compactions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inspect_ai.event import _timeline
+
+    original = _timeline._Inputs.fingerprint
+    work: list[int] = []
+
+    def count_fingerprint(inputs: Any, message: ChatMessage) -> Any:
+        work[-1] += 1
+        return original(inputs, message)
+
+    monkeypatch.setattr(_timeline._Inputs, "fingerprint", count_fingerprint)
+    for size in (100, 200, 400):
+        pool: list[ChatMessage] = [
+            ChatMessageUser(content=f"retained {n}", source="input")
+            for n in range(size)
+        ]
+        pool.extend(ChatMessageUser(content=f"summary {n}") for n in range(size))
+        inputs = _timeline._Inputs([], pool)
+        continuity = _timeline._Continuity(inputs)
+        work.append(0)
+        for n in range(size):
+            event = imported_call(f"summary-{n}", [], "run")
+            event.output = ModelOutput.from_content("imported", f"summary {n}")
+            call = _timeline._Call(event, [], event.output.message)
+            next_input = PoolView(pool, [(0, size), (size + n, size + n + 1)])
+            assert continuity._summarizes(call, next_input)
+        assert work[-1] <= 3 * (len(pool) + size), work
+    assert work[-1] <= 4.2 * work[0], work
+
+
+@pytest.mark.parametrize("origins", [True, False])
+def test_replay_reads_each_pool_row_once_and_folds_linearly(
+    origins: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_linear(
+        log_work(20, monkeypatch, origins), log_work(40, monkeypatch, origins)
+    )
 
 
 def turn_event(
@@ -1612,6 +4225,18 @@ def test_a_rebuilt_message_s_fold_is_linear_in_what_the_log_stores(
         works.append(replay_work(monkeypatch, [], condensed, pool, "sample", info))
     small, large = works
     assert_linear(small, large, doubles=False)
+
+
+def test_replay_tells_apart_pool_rows_whose_murmur3_hashes_collide(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inspect_ai._sentinel import _replay
+
+    collide_murmur3(monkeypatch)
+    keys = _replay._PoolKeys(
+        [ChatMessageUser(content="first"), ChatMessageUser(content="second")]
+    )
+    assert [keys.canonical(0), keys.canonical(1)] == [0, 1]
 
 
 def test_the_fold_over_pool_ranges_is_the_fold_live() -> None:
@@ -1695,12 +4320,12 @@ def r7_generates_the_same_input_twice_at_once() -> Solver:
     return solve
 
 
-def test_overlapping_equal_generates_with_interleaved_retries_are_a_known_difference() -> (
+def test_overlapping_equal_generates_with_interleaved_retries_replay_by_message_id() -> (
     None
 ):
-    # known difference (P4-F2): a generate's later attempts carry no id, so
-    # replay groups them by inference, and two overlapping generates with equal
-    # input whose retries interleave are grouped wrongly
+    # a generate's later attempts carry no id, so replay groups them by their
+    # input; two overlapping generates with equal content but their own
+    # messages keep those messages' ids through the log, which tells them apart
     _Interleaved.requests = 0
     _Interleaved.second = anyio.Event()
     seen: dict[str, Step] = {}
@@ -1719,7 +4344,7 @@ def test_overlapping_equal_generates_with_interleaved_retries_are_a_known_differ
     ]
     assert {id for _, id in live} == set(first_attempts)
     assert len(replay) == len(live) == 4
-    assert replay != live
+    assert replay == live
 
 
 def test_views_read_as_the_lists_they_cut() -> None:
@@ -1943,7 +4568,7 @@ def test_a_person_s_approval_decision_reaches_later_steps(
         sample.events,
         [],
         sample_uuid=sample.uuid or "",
-        eval_info=EvalInfo(inspect_ai_version=None, sentinel=False),
+        eval_info=EvalInfo.from_eval(log.eval),
         human_approvers=(approver_name,),
     )
     last = [s for s in replay if s.stage == "model_input"][-1]
@@ -1953,6 +4578,1126 @@ def test_a_person_s_approval_decision_reaches_later_steps(
     # the person decided before the call ran, so its own result step sees it
     for after in [s for s in replay if s.stage == "tool_result"]:
         assert [d.step_id for d in after.step.human_decisions or []][-1:] == [after.id]
+
+
+def tool_steps(steps: Sequence["ReplayStep"]) -> list[tuple[Any, ...]]:
+    return [
+        (
+            s.stage,
+            s.id,
+            s.step.call.function,
+            s.step.call.arguments,
+            s.step.result.text if isinstance(s.step, AfterToolCall) else None,
+        )
+        for s in steps
+        if isinstance(s.step, BeforeToolCall | AfterToolCall)
+    ]
+
+
+# transcripts shaped as Scout's importers write them, built by hand: no
+# origins, no tools offered, and model inputs expanded
+
+
+def imported_call(
+    uuid: str, input: Sequence[ChatMessage], span_id: str, *calls: ToolCall
+) -> ModelEvent:
+    return ModelEvent(
+        uuid=uuid,
+        span_id=span_id,
+        model="imported",
+        input=list(input),
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput(
+            model="imported",
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatMessageAssistant(
+                        content=f"turn {uuid}",
+                        tool_calls=list(calls) or None,
+                        model="imported",
+                    ),
+                    stop_reason="tool_calls" if calls else "stop",
+                )
+            ],
+        ),
+    )
+
+
+def imported_conversation(
+    span_id: str, *turns: list[ToolCall]
+) -> tuple[list[ChatMessage], list[ModelEvent]]:
+    """A model call for each of `turns` and one for the final answer, each call answered by a tool message `result of <id> in turn <n>`."""
+    messages: list[ChatMessage] = [ChatMessageUser(content="Find the config file.")]
+    calls: list[ModelEvent] = []
+    for n, turn in enumerate([*turns, []]):
+        event = imported_call(f"m{n}", messages, span_id, *turn)
+        calls.append(event)
+        messages.append(event.output.message)
+        messages.extend(
+            ChatMessageTool(
+                content=f"result of {call.id} in turn {n}",
+                tool_call_id=call.id,
+                function=call.function,
+            )
+            for call in turn
+        )
+    return messages, calls
+
+
+def imported_tool_event(
+    call: ToolCall,
+    turn: int,
+    span_id: str,
+    id: str | None = None,
+    function: str | None = None,
+) -> ToolEvent:
+    return ToolEvent(
+        id=id or call.id,
+        function=function or call.function,
+        arguments=call.arguments,
+        result=f"result of {call.id} in turn {turn}",
+        span_id=span_id,
+    )
+
+
+READ = ToolCall(id="call_read", function="read_file", arguments={"path": "a.cfg"})
+LIST = ToolCall(id="call_list", function="list_dir", arguments={"path": "."})
+GREP = ToolCall(id="call_grep", function="grep", arguments={"pattern": "port"})
+
+
+def as_copies(
+    messages: list[ChatMessage], calls: list[ModelEvent]
+) -> tuple[list[ChatMessage], list[ModelEvent]]:
+    """The conversation as LangSmith and Weave write it: each model call's output, in the messages and in later inputs, a copy without its id or model."""
+    copies = {
+        id(event.output.message): event.output.message.model_copy(
+            update={"id": f"copy-{event.uuid}", "model": None}
+        )
+        for event in calls
+    }
+
+    def copied(written: list[ChatMessage]) -> list[ChatMessage]:
+        return [copies.get(id(m), m) for m in written]
+
+    return copied(messages), [
+        event.model_copy(update={"input": copied(event.input)}) for event in calls
+    ]
+
+
+def claude_code_transcript() -> tuple[list[ChatMessage], list[Event]]:
+    # a Task call is written in the sub-agent's span, with no tool span; a
+    # Bash call in its tool span
+    task = ToolCall(id="toolu_task", function="Task", arguments={"prompt": "Look."})
+    bash = ToolCall(id="toolu_bash", function="Bash", arguments={"command": "ls"})
+    messages, (m0, m1, m2) = imported_conversation("session", [task], [bash])
+    task_event = imported_tool_event(task, 0, "agent-toolu_task")
+    task_event.agent_span_id = "agent-toolu_task"
+    return messages, [
+        SpanBeginEvent(id="session", name="session", type="agent"),
+        m0,
+        SpanBeginEvent(
+            id="agent-toolu_task", name="Explore", type="agent", parent_id="session"
+        ),
+        task_event,
+        imported_call("sub", [ChatMessageUser(content="Look.")], "agent-toolu_task"),
+        SpanEndEvent(id="agent-toolu_task"),
+        m1,
+        SpanBeginEvent(id="tool-bash", name="Bash", type="tool", parent_id="session"),
+        imported_tool_event(bash, 1, "tool-bash"),
+        SpanEndEvent(id="tool-bash"),
+        m2,
+        SpanEndEvent(id="session"),
+    ]
+
+
+def spanless_transcript(
+    span_type: str | None, tool_event_ids: bool, copies: bool
+) -> tuple[list[ChatMessage], list[Event]]:
+    # ToolEvents in the run's span, with the call's id or with their own
+    messages, calls = imported_conversation("run", [READ, LIST], [GREP])
+    if copies:
+        messages, calls = as_copies(messages, calls)
+    m0, m1, m2 = calls
+
+    def tool_event(call: ToolCall, turn: int) -> ToolEvent:
+        if tool_event_ids:
+            return imported_tool_event(call, turn, "run")
+        return imported_tool_event(
+            call, turn, "run", id=f"run-{call.id}", function=f"tools.{call.function}"
+        )
+
+    return messages, [
+        SpanBeginEvent(id="run", name="agent run", type=span_type),
+        m0,
+        *[tool_event(call, 0) for call in [READ, LIST]],
+        m1,
+        tool_event(GREP, 1),
+        m2,
+        SpanEndEvent(id="run"),
+    ]
+
+
+def atif_transcript() -> tuple[list[ChatMessage], list[Event]]:
+    # model calls in an agent span, and no ToolEvents
+    messages, calls = imported_conversation("terminus", [READ, LIST], [GREP])
+    return messages, [
+        SpanBeginEvent(id="terminus", name="terminus_2", type="agent"),
+        *calls,
+        SpanEndEvent(id="terminus"),
+    ]
+
+
+IMPORTERS: dict[str, Callable[[], tuple[list[ChatMessage], list[Event]]]] = {
+    "claude_code": claude_code_transcript,
+    # Phoenix: a chain span of no type, ToolEvents keyed by the call's id
+    "phoenix": partial(spanless_transcript, None, True, False),
+    # Logfire: an agent span, ToolEvents keyed by the call's id
+    "logfire": partial(spanless_transcript, "agent", True, False),
+    # LangSmith: an agent span, ToolEvents keyed by their run's id, and copies
+    # of each output in the messages and later inputs
+    "langsmith": partial(spanless_transcript, "agent", False, True),
+    # Weave: a span of no type, ToolEvents keyed by their call's id in Weave,
+    # and copies of each output
+    "weave": partial(spanless_transcript, None, False, True),
+    "atif": atif_transcript,
+}
+
+
+@pytest.mark.parametrize("importer", IMPORTERS)
+def test_an_imported_transcript_is_replayed_from_its_messages(importer: str) -> None:
+    # a transcript with no log header is replayed by sentinel's messages
+    # projection, not from its events
+    messages, events = IMPORTERS[importer]()
+
+    with pytest.raises(
+        ValueError, match="Replay this transcript from its messages instead"
+    ):
+        steps_from_events(
+            messages,
+            events,
+            [],
+            sample_uuid="transcript",
+            eval_info=cast(EvalInfo, None),
+        )
+
+
+@tool
+def not_found() -> Tool:
+    async def execute() -> str:
+        """Fail with a tool error."""
+        raise ToolError("not found")
+
+    return execute
+
+
+def test_a_call_a_fail_fast_tool_halted_has_no_tool_steps() -> None:
+    # Inspect writes the halted call's ToolEvent without a tool span; live ran
+    # no tool stage for it, so replay of a log Inspect wrote builds none
+    def model() -> Any:
+        halting = calls(("not_found", {}), ("not_found", {}))
+        halting.message.metadata = {TOOL_CALLS_FAIL_FAST: ["not_found"]}
+        return outputs(halting, done())
+
+    replay = assert_replay_equals_live(tool_loop(not_found()), model())
+    log = run_logged(tool_loop(not_found()), model())
+    sample = logged_sample(log)
+    [halted] = [
+        index
+        for index, e in enumerate(sample.events)
+        if isinstance(e, ToolEvent) and e.id == "t0c1"
+    ]
+    assert not isinstance(sample.events[halted - 1], SpanBeginEvent)
+    assert [(s.stage, s.id) for s in replay if s.stage.startswith("tool")] == [
+        ("tool_call", "t0c0"),
+        ("tool_result", "t0c0"),
+    ]
+
+
+@pytest.mark.parametrize("version", ["0.3.100", "0.3.200"])
+def test_an_inspect_log_s_calls_without_a_tool_span_keep_no_tool_steps(
+    version: str | None,
+) -> None:
+    # live runs no tool stage for a call it records without a tool span (a
+    # call not executed after an earlier one failed), so a log written by
+    # Inspect, with or without a version in its header, keeps reading its
+    # calls from events
+    messages, events = spanless_transcript(None, True, False)
+    replay = steps_from_events(
+        messages,
+        events,
+        [],
+        sample_uuid="transcript",
+        eval_info=EvalInfo(inspect_ai_version=version, sentinel=False),
+    )
+
+    assert tool_steps(replay) == []
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("message_ids", [False, True])
+@pytest.mark.parametrize("uuids", [False, True])
+@pytest.mark.parametrize(
+    "version", ["0.3.43", "0.3.93", "0.3.94", "0.3.99", "0.3.100.dev1", "0.3.100rc1"]
+)
+def test_a_log_before_0_3_100_is_refused(
+    inputs: str, message_ids: bool, uuids: bool, version: str
+) -> None:
+    from inspect_ai._sentinel import _replay
+
+    user = ChatMessageUser(content="Find the setting")
+    call = ToolCall(id="lookup-call", function="lookup", arguments={})
+    first = linked_call("first", "agent", [user], "Looking", None, call)
+    first.tools = [ToolInfo(name="lookup", description="Find the setting")]
+    result = ChatMessageTool(content="found", tool_call_id=call.id, function="lookup")
+    second = linked_call(
+        "second", "agent", [user, first.output.message, result], "Done", None
+    )
+    if not message_ids:
+        user.id = None
+        first.output.message.id = None
+        result.id = None
+        second.output.message.id = None
+    if not uuids:
+        first.uuid = None
+        second.uuid = None
+    events: list[Event] = [
+        SpanBeginEvent(id="agent", name="agent", type="agent"),
+        first,
+        ToolEvent(
+            id=call.id,
+            function="lookup",
+            arguments={},
+            result="found",
+            message_id=result.id,
+            span_id="agent",
+        ),
+        second,
+        SpanEndEvent(id="agent"),
+    ]
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            [user, first.output.message, result, second.output.message],
+            events,
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version=version, sentinel=False),
+        )
+
+
+@pytest.mark.parametrize("version", ["0.3.43", "0.3.93", "0.3.200"])
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize("execution_error", [False, True])
+def test_nested_tool_events_are_refused_after_json_read(
+    version: str, depth: int, execution_error: bool, tmp_path: Path
+) -> None:
+    log = run_logged(tool_loop(addition()), agent_model())
+    assert log.location
+    stored = read_eval_log(log.location)
+    [sample] = stored.samples or []
+    model_call = next(event for event in sample.events if isinstance(event, ModelEvent))
+    inner = ToolEvent(
+        id="inner",
+        function="addition",
+        arguments={},
+        result="2",
+        error=(
+            ToolCallError(type="timeout", message="timed out")
+            if execution_error
+            else None
+        ),
+    )
+    outer = ToolEvent(
+        id="outer",
+        function="handoff",
+        arguments={},
+        result="done",
+        events=[model_call, inner],
+    )
+    if depth == 2:
+        outer = ToolEvent(
+            id="outermost",
+            function="handoff",
+            arguments={},
+            result="done",
+            events=[outer],
+        )
+    sample.events = [outer]
+    stored.eval.packages["inspect_ai"] = version
+    path = tmp_path / "legacy.json"
+    write_eval_log(stored, path)
+    reread = read_eval_log(str(path))
+    [persisted] = reread.samples or []
+    [parent] = persisted.events
+    assert isinstance(parent, ToolEvent)
+    assert isinstance(parent.events[0], dict)
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            persisted.messages,
+            persisted.events,
+            [],
+            sample_uuid=persisted.uuid or "",
+            eval_info=EvalInfo.from_eval(reread.eval),
+        )
+
+
+@pytest.mark.parametrize("version", [None, "unknown"])
+@pytest.mark.parametrize("serialized", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_unknown_version_refuses_nested_spanless_native_tool(
+    version: str | None, serialized: bool, failed: bool
+) -> None:
+    inner = ToolEvent(
+        id="inner",
+        function="addition",
+        arguments={},
+        result="2",
+        completed=datetime.now(timezone.utc),
+        failed=failed,
+    )
+    outer = ToolEvent(
+        id="outer", function="handoff", arguments={}, result="done", events=[inner]
+    )
+    if serialized:
+        outer = ToolEvent.model_validate_json(outer.model_dump_json())
+        assert isinstance(outer.events[0], dict)
+    events: list[Event] = [
+        SpanBeginEvent(id="outer-span", name="handoff", type="tool"),
+        outer,
+        SpanEndEvent(id="outer-span"),
+    ]
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            [], events, [], sample_uuid="sample", eval_info=EvalInfo(version, False)
+        )
+
+
+@pytest.mark.parametrize("version", [None, "unknown"])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_unknown_version_keeps_failed_tool_with_matching_span(
+    version: str | None, serialized: bool
+) -> None:
+    messages, events, pool = _historical_approval_events("expanded", "approve", True)
+    tool = next(event for event in events if isinstance(event, ToolEvent))
+    tool.failed = True
+    tool.completed = datetime.now(timezone.utc)
+    if serialized:
+        adapter = TypeAdapter(list[Event])
+        events = adapter.validate_json(adapter.dump_json(events))
+    replay = steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo(version, False),
+    )
+    assert [step.stage for step in replay if step.stage.startswith("tool")] == [
+        "tool_call"
+    ]
+
+
+@pytest.mark.parametrize("version", [None, "unknown", "0.3.100", "0.3.200"])
+@pytest.mark.parametrize("finalized", [False, True])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_spanless_halted_tool_is_allowed(
+    version: str | None, finalized: bool, serialized: bool
+) -> None:
+    halted = ToolEvent(
+        id="halted",
+        function="addition",
+        arguments={},
+        pending=None if finalized else True,
+        completed=datetime.now(timezone.utc) if finalized else None,
+        error=(
+            ToolCallError(type="cancelled", message="earlier call failed")
+            if finalized
+            else None
+        ),
+    )
+    if serialized:
+        halted = ToolEvent.model_validate_json(halted.model_dump_json())
+    events: list[Event] = [halted]
+    assert (
+        steps_from_events(
+            [], events, [], sample_uuid="sample", eval_info=EvalInfo(version, False)
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("version", [None, "unknown", "0.3.100", "0.3.200"])
+def test_spanless_timeout_is_refused_only_without_a_known_version(
+    version: str | None,
+) -> None:
+    # Ransom's 39th review O1: cancelling a call awaiting approval records it
+    # as an execution timeout of an older log does
+    halted = ToolEvent(
+        id="halted",
+        function="addition",
+        arguments={},
+        completed=datetime.now(timezone.utc),
+        error=ToolCallError(type="timeout", message="cancelled by operator"),
+    )
+
+    def replay() -> list["ReplayStep"]:
+        return steps_from_events(
+            [], [halted], [], sample_uuid="sample", eval_info=EvalInfo(version, False)
+        )
+
+    if version in (None, "unknown"):
+        with pytest.raises(ValueError, match="0.3.100 or later"):
+            replay()
+    else:
+        assert replay() == []
+
+
+def answers_as_a_person(decision: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Have the built-in `human` approver's panel decide `decision`; a modify sets x to 7."""
+    from inspect_ai.approval._human import acp as acp_module
+    from inspect_ai.approval._human import approver as approver_module
+
+    async def acp(**kwargs: object) -> Approval | None:
+        return None
+
+    async def panel(
+        message: str,
+        call: ToolCall,
+        view: ToolCallView,
+        history: object,
+        choices: list[str],
+    ) -> Approval:
+        if decision == "modify":
+            return Approval(
+                decision="modify",
+                modified=replace(call, arguments={**call.arguments, "x": 7}),
+                explanation="seven",
+            )
+        return Approval(
+            decision=cast(ApprovalDecision, decision), explanation=f"{decision} it"
+        )
+
+    monkeypatch.setattr(acp_module, "request_human_approval_via_acp", acp)
+    monkeypatch.setattr(approver_module, "panel_approval", panel)
+
+
+@pytest.mark.parametrize(
+    "decision,action",
+    [
+        ("approve", "proceed"),
+        ("reject", "reject"),
+        ("terminate", "terminate"),
+        ("modify", "modify"),
+        ("escalate", None),
+    ],
+)
+def test_a_human_approver_s_decision_reaches_later_steps_in_a_log_without_origins(
+    decision: str, action: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from inspect_ai.approval import auto_approver, human_approver
+
+    answers_as_a_person(decision, monkeypatch)
+    policies = [ApprovalPolicy(human_approver(), "*")]
+    if decision == "escalate":
+        # the person passes the call on to the next approver
+        policies.append(ApprovalPolicy(auto_approver(), "*"))
+    log = run_logged(
+        r7_continues_after_a_termination()
+        if decision == "terminate"
+        else tool_loop(addition()),
+        agent_model(2),
+        approval=policies,
+    )
+    sample = logged_sample(log)
+    replay = steps_from_events(
+        sample.messages,
+        without_origins(sample.events),
+        [],
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(log.eval),
+        human_approvers=("human",),
+    )
+    # a call the person rejected or ended never reached its tool_call step
+    first = next(e.id for e in sample.events if isinstance(e, ToolEvent))
+    later = [s for s in replay if s.stage == "model_input"][-1]
+    decisions = list(later.step.human_decisions or [])
+    if action is None:
+        assert decisions == []
+        return
+    assert decisions
+    assert decisions[0].step_id == first
+    assert decisions[0].call_ids == (first,)
+    reported = decisions[0].decided
+    assert (reported.name, reported.path) == ("human", "human")
+    assert reported.report.action == action
+    if action == "modify":
+        assert reported.report.modified is not None
+        assert reported.report.modified.arguments["x"] == 7
+
+
+def _historical_approval_events(
+    inputs: str, decision: str, legacy_arguments: bool
+) -> tuple[list[ChatMessage], list[Event], list[ChatMessage]]:
+    from inspect_ai._sentinel import _replay
+
+    user = ChatMessageUser(content="Add one")
+    proposal = ToolCall(id="c1", function="addition", arguments={"x": 1, "y": 1})
+    approved = replace(proposal, arguments={"x": 7, "y": 1})
+    first = linked_call("m1", "agent", [user], "Adding", None, proposal)
+    first.tools = [ToolInfo(name="addition", description="Add numbers")]
+    result_text = "8" if decision == "modify" else "2"
+    result = ChatMessageTool(
+        content=result_text, tool_call_id="c1", function="addition"
+    )
+    second = linked_call(
+        "m2", "agent", [user, first.output.message, result], "Done", None
+    )
+    events: list[Event] = [
+        SpanBeginEvent(id="agent", name="agent", type="agent"),
+        first,
+        ApprovalEvent(
+            message="Adding",
+            call=proposal,
+            approver="human",
+            decision=cast(ApprovalDecision, decision),
+            modified=approved if decision == "modify" else None,
+            span_id="agent",
+        ),
+    ]
+    if decision in ("approve", "modify"):
+        events.extend(
+            [
+                SpanBeginEvent(
+                    id="tool", name="addition", type="tool", parent_id="agent"
+                ),
+                ToolEvent(
+                    id="c1",
+                    function="addition",
+                    arguments=proposal.arguments
+                    if legacy_arguments
+                    else approved.arguments,
+                    result=result_text,
+                    message_id=result.id,
+                    span_id="tool",
+                ),
+                SpanEndEvent(id="tool"),
+            ]
+        )
+    events.extend([second, SpanEndEvent(id="agent")])
+    events = solving(events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    adapter = TypeAdapter(list[Event])
+    return (
+        [user, first.output.message, result, second.output.message],
+        adapter.validate_json(adapter.dump_json(events)),
+        pool,
+    )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_modern_approval_tool_stages_use_recorded_arguments(
+    inputs: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    messages, events, pool = _historical_approval_events(inputs, "modify", False)
+    replay = steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo("0.3.277", False),
+        human_approvers=("human",),
+    )
+    assert [
+        step.step.call.arguments
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ] == [{"x": 7, "y": 1}, {"x": 7, "y": 1}]
+    later = next(
+        step for step in replay if step.stage == "model_input" and step.id == "m2"
+    )
+    assert [
+        decision.decided.report.action for decision in later.step.human_decisions or []
+    ] == ["modify"]
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "Skipped human decisions from ApprovalEvents" in record.message
+    ]
+    assert not warnings
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+def test_modern_approval_without_modified_payload_keeps_tool_stages(
+    inputs: str, decision: str
+) -> None:
+    messages, events, pool = _historical_approval_events(inputs, "approve", True)
+    approval = next(event for event in events if isinstance(event, ApprovalEvent))
+    approval.decision = cast(ApprovalDecision, decision)
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    replay = steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo("0.3.277", False),
+    )
+    tool_steps = [
+        step.step
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert [step.call.arguments for step in tool_steps] == [
+        {"x": 1, "y": 1},
+        {"x": 1, "y": 1},
+    ]
+    assert isinstance(tool_steps[1], AfterToolCall)
+    assert tool_steps[1].result.text == "2"
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("version", ["0.3.100", None, "0.3.277", "0.3.285", "0.3.300"])
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+def test_modern_approval_uses_executed_tool_view_at_both_stages(
+    inputs: str, version: str | None, decision: str
+) -> None:
+    """A ToolEvent that records the modified call replays whatever the header says."""
+    from inspect_ai._sentinel import _replay
+
+    path = Path(__file__).parent / "fixtures" / "approval_modified_0.3.100.json"
+    log = read_eval_log(str(path), resolve_attachments="full")
+    [sample] = log.samples or []
+    events: list[Event] = []
+    for event in sample.events:
+        if isinstance(event, ApprovalEvent):
+            event = event.model_copy(update={"decision": decision})
+        elif isinstance(event, ToolEvent):
+            event = event.model_copy(
+                update={
+                    "arguments": {"x": 7, "y": 1},
+                    "view": ToolCallContent(
+                        format="markdown",
+                        content="```python\naddition(x=7, y=1)\n```\n",
+                    ),
+                }
+            )
+        events.append(event)
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    replay = steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "sample",
+        eval_info=EvalInfo(version, False),
+    )
+    tool_steps = [
+        step.step
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert [step.call.arguments for step in tool_steps] == [
+        {"x": 7, "y": 1},
+        {"x": 7, "y": 1},
+    ]
+    assert [
+        step.view.call.content if step.view.call is not None else None
+        for step in tool_steps
+    ] == ["```python\naddition(x=7, y=1)\n```\n"] * 2
+    assert tool_steps[0].view.context is None
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+@pytest.mark.parametrize("renamed", [False, True])
+@pytest.mark.parametrize("version", ["0.3.100", "0.3.300", None])
+def test_older_modified_approval_log_is_refused(
+    inputs: str, decision: str, renamed: bool, version: str | None
+) -> None:
+    """The archived 0.3.100 sample cannot identify the executed call, even under the newer header a retried eval gives it."""
+    from inspect_ai._sentinel import _replay
+
+    path = Path(__file__).parent / "fixtures" / "approval_modified_0.3.100.json"
+    log = read_eval_log(str(path), resolve_attachments="full")
+    [sample] = log.samples or []
+    approval = next(e for e in sample.events if isinstance(e, ApprovalEvent))
+    assert approval.modified is not None
+    events: list[Event] = []
+    for event in sample.events:
+        if event is approval:
+            modified = (
+                replace(approval.modified, function="renamed")
+                if renamed
+                else approval.modified
+            )
+            event = approval.model_copy(
+                update={"decision": decision, "modified": modified}
+            )
+        elif renamed and isinstance(event, SpanBeginEvent) and event.type == "tool":
+            event = event.model_copy(update={"name": "renamed"})
+        events.append(event)
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    # without a version, the renamed tool span reads as a log before 0.3.94
+    refusal = (
+        r"0\.3\.100 or later"
+        if renamed and version is None
+        else r"approved call does not match the ToolEvent that ran"
+    )
+    with pytest.raises(
+        ValueError,
+        match=rf"{refusal}.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            sample.messages,
+            events,
+            pool,
+            sample_uuid=sample.uuid or "sample",
+            eval_info=EvalInfo(version, False),
+        )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("version", [None, "unknown"])
+def test_unknown_version_modified_approval_is_refused(
+    inputs: str, version: str | None
+) -> None:
+    messages, events, pool = _historical_approval_events(inputs, "modify", True)
+    with pytest.raises(
+        ValueError,
+        match=r"approved call does not match the ToolEvent that ran.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            messages,
+            events,
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(version, False),
+        )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_older_unmodified_approval_still_replays(inputs: str) -> None:
+    messages, events, pool = _historical_approval_events(inputs, "approve", True)
+    replay = steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo("0.3.100", False),
+    )
+    tool_steps = [
+        step.step
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert [step.call.arguments for step in tool_steps] == [
+        {"x": 1, "y": 1},
+        {"x": 1, "y": 1},
+    ]
+    assert isinstance(tool_steps[1], AfterToolCall)
+    assert tool_steps[1].result.text == "2"
+
+
+@pytest.mark.parametrize("version", [None, "unknown"])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_unknown_version_nested_modified_approval_is_refused_as_an_earlier_log(
+    version: str | None, serialized: bool
+) -> None:
+    _, events, _ = _historical_approval_events("expanded", "modify", True)
+    approval = next(e for e in events if isinstance(e, ApprovalEvent))
+    outer = ToolEvent(id="outer", function="outer", arguments={}, events=[approval])
+    if serialized:
+        outer = ToolEvent.model_validate_json(outer.model_dump_json())
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            [], [outer], [], sample_uuid="sample", eval_info=EvalInfo(version, False)
+        )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("decision", ["reject", "terminate"])
+@pytest.mark.parametrize(
+    "version,reconstruct",
+    [
+        ("0.3.100", False),
+        ("0.3.276", False),
+        ("0.3.277rc1", False),
+        (None, False),
+        ("unknown", False),
+        ("0.3.277", True),
+        ("0.3.300", True),
+    ],
+)
+def test_approval_decision_without_tool_event_respects_log_version(
+    inputs: str,
+    decision: str,
+    version: str | None,
+    reconstruct: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    messages, events, pool = _historical_approval_events(inputs, decision, True)
+    assert not any(isinstance(event, ToolEvent) for event in events)
+    replay = steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo(version, False),
+        human_approvers=("human",),
+    )
+    assert not [step for step in replay if step.stage.startswith("tool")]
+    later = next(
+        step for step in replay if step.stage == "model_input" and step.id == "m2"
+    )
+    decisions = list(later.step.human_decisions or [])
+    assert [recorded.decided.report.action for recorded in decisions] == (
+        [decision] if reconstruct else []
+    )
+    if reconstruct:
+        assert decisions[0].step_id == "c1"
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "Skipped human decisions from ApprovalEvents" in record.message
+    ]
+    assert len(warnings) == (0 if reconstruct else 1)
+
+
+@pytest.mark.parametrize("human_approvers", [(), ("other",)])
+def test_old_log_warns_only_for_selected_human_approvals(
+    human_approvers: tuple[str, ...], caplog: pytest.LogCaptureFixture
+) -> None:
+    messages, events, pool = _historical_approval_events("expanded", "reject", True)
+    steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo("0.3.100", False),
+        human_approvers=human_approvers,
+    )
+    assert not [
+        record
+        for record in caplog.records
+        if "Skipped human decisions from ApprovalEvents" in record.message
+    ]
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize(
+    "approval,sentinel_x,event_x,before_x,after_x",
+    [
+        (False, None, 1, 1, 1),
+        (True, None, 7, 7, 7),
+        (False, 9, 9, 1, 9),
+        (True, 9, 9, 7, 9),
+        (True, 1, 1, 7, 1),
+    ],
+)
+def test_recorded_sentinel_change_controls_executed_arguments(
+    inputs: str,
+    approval: bool,
+    sentinel_x: int | None,
+    event_x: int,
+    before_x: int,
+    after_x: int,
+) -> None:
+    messages, events, pool = _historical_approval_events(inputs, "modify", True)
+    if not approval:
+        events = [event for event in events if not isinstance(event, ApprovalEvent)]
+    tool = next(event for event in events if isinstance(event, ToolEvent))
+    tool.arguments = {"x": event_x, "y": 1}
+    if sentinel_x is not None:
+        proposal = ToolCall(id="c1", function="addition", arguments={"x": 1, "y": 1})
+        check: list[Event] = [
+            SpanBeginEvent(
+                id="check", name="probe", type="sentinel", parent_id="agent"
+            ),
+            SentinelEvent(
+                factory="probe",
+                path="probe",
+                function="check",
+                step_id="c1",
+                conversation="agent",
+                stage="tool_call",
+                kind="decision",
+                status="reported",
+                action="modify",
+                modified=replace(proposal, arguments={"x": sentinel_x, "y": 1}),
+                span_id="check",
+            ),
+            SpanEndEvent(id="check"),
+        ]
+        begin = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, SpanBeginEvent) and event.id == "tool"
+        )
+        events[begin:begin] = check
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    replay = steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo("0.3.277", sentinel_x is not None),
+        human_approvers=("human",),
+    )
+    assert [
+        step.step.call.arguments["x"]
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ] == [before_x, after_x]
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_sentinel_modify_does_not_match_a_different_json_argument_type(
+    inputs: str,
+) -> None:
+    messages, events, pool = _historical_approval_events(inputs, "approve", True)
+    events = [event for event in events if not isinstance(event, ApprovalEvent)]
+    proposal = ToolCall(id="c1", function="addition", arguments={"x": 1, "y": 1})
+    check: list[Event] = [
+        SpanBeginEvent(id="check", name="probe", type="sentinel", parent_id="agent"),
+        SentinelEvent(
+            factory="probe",
+            path="probe",
+            function="check",
+            step_id="c1",
+            conversation="agent",
+            stage="tool_call",
+            kind="decision",
+            status="reported",
+            action="modify",
+            modified=replace(proposal, arguments={"x": True, "y": 1}),
+            span_id="check",
+        ),
+        SpanEndEvent(id="check"),
+    ]
+    begin = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, SpanBeginEvent) and event.id == "tool"
+    )
+    events[begin:begin] = check
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    replay = steps_from_events(
+        messages,
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo("0.3.277", True),
+    )
+    tool_steps = [
+        step.step
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert [step.call.arguments["x"] for step in tool_steps] == [1, 1]
+    assert all(type(step.call.arguments["x"]) is int for step in tool_steps)
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("decision", ["reject", "terminate"])
+@pytest.mark.parametrize("reused_id", [True, False])
+@pytest.mark.parametrize("later_approval", [True, False])
+def test_a_prior_decision_survives_a_later_execution_with_reused_id(
+    inputs: str, decision: str, reused_id: bool, later_approval: bool
+) -> None:
+    from inspect_ai._sentinel import _replay
+
+    messages, events, _ = _historical_approval_events("expanded", decision, True)
+    del events[-2:]
+    later_id = "c1" if reused_id else "c2"
+    proposal = ToolCall(id=later_id, function="addition", arguments={"x": 2, "y": 1})
+    later = linked_call("m3", "agent", messages, "Try again", None, proposal)
+    later.tools = [ToolInfo(name="addition", description="Add numbers")]
+    result = ChatMessageTool(content="3", tool_call_id=later_id, function="addition")
+    final = linked_call(
+        "m4", "agent", [*messages, later.output.message, result], "Done", None
+    )
+    events.append(later)
+    if later_approval:
+        events.append(
+            ApprovalEvent(
+                message="Try again",
+                call=proposal,
+                approver="human",
+                decision="approve",
+                span_id="agent",
+            )
+        )
+    events.extend(
+        [
+            SpanBeginEvent(
+                id="later-tool", name="addition", type="tool", parent_id="agent"
+            ),
+            ToolEvent(
+                id=later_id,
+                function="addition",
+                arguments=proposal.arguments,
+                result="3",
+                message_id=result.id,
+                span_id="later-tool",
+            ),
+            SpanEndEvent(id="later-tool"),
+            final,
+            SpanEndEvent(id="agent"),
+            SpanEndEvent(id="solvers"),
+        ]
+    )
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    replay = steps_from_events(
+        [*messages, later.output.message, result, final.output.message],
+        events,
+        pool,
+        sample_uuid="sample",
+        eval_info=EvalInfo("0.3.277", False),
+        human_approvers=("human",),
+    )
+    intervening = next(
+        step for step in replay if step.stage == "model_input" and step.id == "m2"
+    )
+    assert [
+        recorded.decided.report.action
+        for recorded in intervening.step.human_decisions or []
+    ] == [decision]
+    assert [step.stage for step in replay if step.stage.startswith("tool")] == [
+        "tool_call",
+        "tool_result",
+    ]
 
 
 @tool
@@ -2109,6 +5854,9 @@ def test_a_call_run_in_a_final_region_has_no_tool_steps() -> None:
     replay = assert_replay_equals_live(
         r7_runs_a_helpers_call_in_its_region(),
         outputs(call("addition", x=1, y=1), done()),
+        # a model_origin() region is not in the span tree, so without origins
+        # the helper's call is a turn and its calls are checked
+        inferred="a model_origin() region",
     )
     assert not [s for s in replay if s.stage.startswith("tool")]
 
@@ -2133,6 +5881,651 @@ def test_a_task_scorer_s_tool_calls_have_no_tool_steps() -> None:
         scorer=r7_scores_with_a_tool_loop(),
     )
     assert not [s for s in replay if s.stage.startswith("tool")]
+
+
+@scorer(metrics=[])
+def r7_scores_with_a_helper_tool() -> Scorer:
+    async def score(state: TaskState, target: Target) -> Score:
+        tools = [asks_a_helper()]
+        output = await get_model().generate("Check the sum.", tools)
+        await execute_tools(
+            [ChatMessageUser(content="Check the sum."), output.message], tools
+        )
+        return Score(value=1)
+
+    return score
+
+
+@scorer(metrics=[])
+def r7_scores_in_an_agent_span() -> Scorer:
+    async def score(state: TaskState, target: Target) -> Score:
+        async with span("checker", type="agent"):
+            tools = [asks_a_helper()]
+            output = await get_model().generate("Check the sum.", tools)
+            await execute_tools(
+                [ChatMessageUser(content="Check the sum."), output.message], tools
+            )
+        return Score(value=1)
+
+    return score
+
+
+@pytest.mark.parametrize("arrangement", ["helper_tool", "agent_span"])
+def test_a_task_scorer_s_nested_calls_have_no_tool_steps_without_origins(
+    arrangement: str,
+) -> None:
+    # Ransom's fourth review: the scorers' scope is final live, through a
+    # tool whose helper model proposes and runs a call, directly or inside an
+    # agent span; with origins removed their calls are a scorer's, and none
+    # has tool steps
+    replay = assert_replay_equals_live(
+        generate(),
+        outputs(done(), call("asks_a_helper")),
+        scorer=r7_scores_with_a_helper_tool()
+        if arrangement == "helper_tool"
+        else r7_scores_in_an_agent_span(),
+    )
+    assert [s.stage for s in replay] == ["model_input", "model_output"]
+
+
+@scorer(metrics=[])
+def r7_scores_with_a_prefilled_call() -> Scorer:
+    async def score(state: TaskState, target: Target) -> Score:
+        prefilled = ChatMessageAssistant(content="", tool_calls=[addition_call("p")])
+        asked: list[ChatMessage] = [ChatMessageUser(content="Check."), prefilled]
+        result = await execute_tools(asked, [addition()])
+        await get_model().generate([*asked, *result.messages])
+        return Score(value=1)
+
+    return score
+
+
+def test_a_pre_filled_call_a_scorer_runs_has_no_tool_steps() -> None:
+    # review of 06bf969be: a call no model call made, run in the scorers'
+    # final scope, was taken as checked, with origins recorded or not
+    replay = assert_replay_equals_live(
+        generate(),
+        outputs(done(), done("ok")),
+        scorer=r7_scores_with_a_prefilled_call(),
+    )
+    assert [s.stage for s in replay] == ["model_input", "model_output"]
+
+
+def test_a_log_from_before_tool_spans_is_refused() -> None:
+    # Inspect 0.3.43 recorded the scorer phase with StepEvents, but cannot
+    # supply the native tool spans required for reliable replay.
+    log = read_eval_log(
+        str(Path(__file__).parent.parent / "log" / "test_list_logs" / "custom.eval"),
+        resolve_attachments="full",
+    )
+    [sample] = log.samples or []
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            sample.messages,
+            sample.events,
+            [],
+            sample_uuid=sample.uuid or "sample",
+            eval_info=EvalInfo.from_eval(log.eval),
+        )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("versioned", [True, False])
+def test_the_archived_0_3_99_log_is_refused(inputs: str, versioned: bool) -> None:
+    # Inspect 0.3.99 ran each solver in a top-level span, with no solvers span;
+    # without its version the layout alone refuses it
+    from inspect_ai._sentinel import _replay
+
+    path = Path(__file__).parent / "fixtures" / "approval_modified_0.3.99.json"
+    log = read_eval_log(str(path), resolve_attachments="full")
+    [sample] = log.samples or []
+    events: list[Event] = list(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            sample.messages,
+            events,
+            pool,
+            sample_uuid=sample.uuid or "sample",
+            eval_info=EvalInfo.from_eval(log.eval)
+            if versioned
+            else EvalInfo(None, False),
+        )
+
+
+@scorer(metrics=[])
+def constant() -> Scorer:
+    async def apply(state: TaskState, target: Target) -> Score:
+        return Score(value=1)
+
+    return apply
+
+
+def rescored(log: EvalLog, action: Literal["append", "overwrite"] | None) -> EvalLog:
+    from inspect_ai import score
+
+    if action is None:
+        return log
+    return score(log.model_copy(deep=True), constant(), action=action, display="none")
+
+
+def replay_sample(
+    log: EvalLog, origins: bool, inputs: str, versioned: bool = True
+) -> list["ReplayStep"]:
+    from inspect_ai._sentinel import _replay
+
+    [sample] = log.samples or []
+    sample = EvalSample.model_validate_json(sample.model_dump_json())
+    events = sample.events if origins else without_origins(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    return steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "sample",
+        eval_info=EvalInfo.from_eval(log.eval) if versioned else EvalInfo(None, False),
+    )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("action", ["append", "overwrite"])
+@pytest.mark.parametrize("approval", ["unchanged", "none"])
+def test_a_rescored_then_retried_0_3_99_sample_is_refused(
+    inputs: str, action: Literal["append", "overwrite"], approval: str
+) -> None:
+    # Ransom's review 37 B1: rescoring adds a top-level scorers span to an
+    # older sample, which a retried eval keeps under a newer header; the
+    # approval is left unchanged so only the layout refuses it
+    from inspect_ai._sentinel import _replay
+
+    path = Path(__file__).parent / "fixtures" / "approval_modified_0.3.99.json"
+    log = rescored(read_eval_log(str(path), resolve_attachments="full"), action)
+    [sample] = log.samples or []
+    sample = EvalSample.model_validate_json(sample.model_dump_json())
+    assert any(
+        isinstance(e, SpanBeginEvent) and e.parent_id is None and e.name == "scorers"
+        for e in sample.events
+    )
+    events: list[Event] = [
+        e.model_copy(update={"decision": "approve", "modified": None})
+        if isinstance(e, ApprovalEvent)
+        else e
+        for e in sample.events
+        if approval == "unchanged" or not isinstance(e, ApprovalEvent)
+    ]
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            sample.messages,
+            events,
+            pool,
+            sample_uuid=sample.uuid or "sample",
+            eval_info=EvalInfo("0.3.200", False),
+        )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("origins", [True, False])
+@pytest.mark.parametrize("cleanup", [False, True])
+@pytest.mark.parametrize("action", ["append", "overwrite"])
+@pytest.mark.parametrize("shape", ["call", "parallel", "handoff", "store_handoff"])
+def test_a_rescored_log_replays_its_tool_stages(
+    shape: str,
+    action: Literal["append", "overwrite"],
+    cleanup: bool,
+    origins: bool,
+    inputs: str,
+) -> None:
+    # Review of 76e89a08b: rescoring rebuilds the events from the span tree,
+    # which moves each ToolEvent after its tool span's end; review of
+    # bf13d1da7: a handoff whose agent writes to the store ends with a
+    # StoreEvent after its tool span
+    from inspect_ai.solver import chain
+
+    @agent
+    def writer() -> Agent:
+        async def execute(state: AgentState) -> AgentState:
+            """Record the answer in the store."""
+            store().set("answer", 2)
+            state.output = done("2")
+            return state
+
+        return execute
+
+    @solver
+    def cleans_up() -> Solver:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            await get_model().generate("cleanup")
+            return state
+
+        return solve
+
+    async def cleanup_chain(state: TaskState) -> None:
+        async def no_generate(*args: Any, **kwargs: Any) -> TaskState:
+            raise AssertionError("cleanup does not generate")
+
+        await chain(cleans_up())(state, no_generate)
+
+    tools: list[Tool] = {
+        "handoff": [
+            handoff(helper(outputs(call("addition", x=2, y=3), done("helper done"))))
+        ],
+        "store_handoff": [handoff(writer())],
+    }.get(shape, [addition()])
+    first = {
+        "call": call("addition", x=1, y=1),
+        "parallel": calls(
+            ("addition", {"x": 1, "y": 1}), ("addition", {"x": 2, "y": 2})
+        ),
+        "handoff": call("transfer_to_helper"),
+        "store_handoff": call("transfer_to_writer"),
+    }[shape]
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=tool_loop(*tools),
+        cleanup=cleanup_chain if cleanup else None,
+    )
+    log = eval(task, model=outputs(first, done(), done("cleaned")))[0]
+    assert log.status == "success", log.error
+    log = read_eval_log(str(log.location), resolve_attachments="full")
+    tool_calls = len(first.message.tool_calls or []) + (shape == "handoff")
+
+    def stages(
+        log: EvalLog, versioned: bool = True
+    ) -> list[tuple[str, str, tuple[str, int], Any]]:
+        return [
+            (s.stage, s.id, s.segment, comparable(s.step))
+            for s in replay_sample(log, origins, inputs, versioned)
+        ]
+
+    before = stages(log)
+    assert [stage for stage, *_ in before].count("tool_result") == tool_calls
+    after = rescored(log, action)
+    if shape == "store_handoff":
+        assert (after.samples or [])[0].store == {"answer": 2}
+    assert stages(after) == before
+    assert stages(after, versioned=False) == stages(log, versioned=False)
+
+
+@pytest.mark.parametrize("action", [None, "append", "overwrite"])
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("versioned", [True, False])
+def test_an_archived_0_3_100_log_replays(
+    inputs: str, versioned: bool, action: Literal["append", "overwrite"] | None
+) -> None:
+    # Inspect 0.3.100's solvers and scorers spans keep the scorer's model call
+    # out of the agent's turns in a log without origins
+    path = Path(__file__).parent / "fixtures" / "scored_0.3.100.json"
+    log = read_eval_log(str(path), resolve_attachments="full")
+    assert log.eval.packages["inspect_ai"] == "0.3.100"
+    replay = replay_sample(rescored(log, action), True, inputs, versioned)
+    assert [s.stage for s in replay] == [
+        "model_input",
+        "model_output",
+        "tool_call",
+        "tool_result",
+        "model_input",
+        "model_output",
+    ]
+
+
+@pytest.mark.parametrize("grouping", ["target", "rollback"])
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_a_stored_timeline_groups_uuid_less_events(inputs: str, grouping: str) -> None:
+    # Ransom's 39th review B2: condensing expanded inputs replaces the model
+    # events a stored timeline holds, which are keyed by identity without a uuid
+    from inspect_ai._sentinel import _replay
+
+    path = Path(__file__).parent / "fixtures" / "scored_0.3.100.json"
+    [sample] = read_eval_log(str(path), resolve_attachments="full").samples or []
+    events = list(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    first, second = [
+        TimelineEvent(event=e)
+        for e in events
+        if isinstance(e, ModelEvent) and e.span_id is not None and e.uuid is None
+    ][:2]
+    root = TimelineSpan(id="target", name="target", content=[first])
+    if grouping == "target":
+        root.content.append(second)
+    else:
+        root.branches.append(
+            TimelineSpan(id="rollback", name="rollback", content=[second])
+        )
+    replay = steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "sample",
+        eval_info=EvalInfo("0.3.100", False),
+        timeline=Timeline(name="target", description="", root=root),
+    )
+
+    assert [s.step.conversation for s in replay if s.stage == "model_input"] == [
+        "target",
+        "target" if grouping == "target" else "rollback",
+    ]
+
+
+def earlier_layout(layout: str, wrapped: bool) -> tuple[list[ChatMessage], list[Event]]:
+    """A model call in a solver span, a scorer span, or between a scorer's steps; `wrapped` puts the span in the `solvers` or `scorers` span, as Inspect 0.3.100 does."""
+    user = ChatMessageUser(content="Solve it.")
+    if layout == "scorer_step":
+        call = linked_call("m1", None, [user], "Solved.", None)
+        return [user, call.output.message], [
+            StepEvent(action="begin", type="scorer", name="match"),
+            call,
+            StepEvent(action="end", type="scorer", name="match"),
+        ]
+    call = linked_call("m1", "work", [user], "Solved.", None)
+    kind = "solver" if layout == "solver_span" else "scorer"
+    phase = f"{kind}s"
+    events: list[Event] = [
+        SpanBeginEvent(
+            id="work", name="work", type=kind, parent_id=phase if wrapped else None
+        ),
+        call,
+        SpanEndEvent(id="work"),
+    ]
+    if wrapped:
+        events = [
+            SpanBeginEvent(id=phase, name=phase, type=phase),
+            *events,
+            SpanEndEvent(id=phase),
+        ]
+    return [user, call.output.message], events
+
+
+@pytest.mark.parametrize("layout", ["solver_span", "scorer_span", "scorer_step"])
+@pytest.mark.parametrize("version", [None, "unknown", "0.3.99", "0.3.100", "0.3.200"])
+def test_a_log_in_a_layout_before_0_3_100_is_refused(
+    layout: str, version: str | None
+) -> None:
+    # Ransom's review 21 B1 and B2: an agent or scorer outside the solvers or
+    # scorers span cannot be told apart, so the log is refused; a retried
+    # eval keeps such samples under a newer header
+    messages, events = earlier_layout(layout, wrapped=False)
+    with pytest.raises(
+        ValueError,
+        match="0.3.100 or later.*Replay this transcript from its messages instead",
+    ):
+        steps_from_events(
+            messages,
+            events,
+            [],
+            sample_uuid="sample",
+            eval_info=EvalInfo(version, False),
+        )
+
+
+@pytest.mark.parametrize(
+    "layout,stages",
+    [("solver_span", ["model_input", "model_output"]), ("scorer_span", [])],
+)
+@pytest.mark.parametrize("version", [None, "unknown", "0.3.100"])
+def test_a_log_in_the_0_3_100_layout_replays(
+    layout: str, stages: list[str], version: str | None
+) -> None:
+    messages, events = earlier_layout(layout, wrapped=True)
+    replay = steps_from_events(
+        messages, events, [], sample_uuid="sample", eval_info=EvalInfo(version, False)
+    )
+    assert [s.stage for s in replay] == stages
+
+
+def linked_call(
+    uuid: str,
+    span_id: str | None,
+    input: list[ChatMessage],
+    text: str,
+    origin: str | None,
+    *calls: ToolCall,
+) -> ModelEvent:
+    return ModelEvent(
+        uuid=uuid,
+        span_id=span_id,
+        model="mockllm/model",
+        origin=origin,
+        input=input,
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput(
+            model="mockllm/model",
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatMessageAssistant(
+                        content=text, tool_calls=list(calls) or None
+                    ),
+                    stop_reason="tool_calls" if calls else "stop",
+                )
+            ],
+        ),
+    )
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("shape", ["fork", "candidate"])
+def test_executed_tool_keeps_stages_when_producing_call_is_discarded(
+    shape: str, inputs: str
+) -> None:
+    from inspect_ai._sentinel import _replay
+
+    opening: list[ChatMessage] = [ChatMessageUser(content="Start the task")]
+    first = linked_call("first", "agent", opening, "First answer", None)
+    carried = [*opening, first.output.message]
+    tool_call = ToolCall(id="discarded-tool", function="lookup", arguments={})
+    if shape == "fork":
+        discarded_input = carried
+        kept = linked_call("kept", "agent", carried, "Kept answer", None)
+        continued_input = [*carried, kept.output.message]
+    else:
+        kept = linked_call("kept", "agent", carried, "Kept answer", None)
+        discarded_input = [ChatMessageUser(content="Side question")]
+        continued_input = [*carried, kept.output.message]
+    discarded = linked_call(
+        "discarded", "agent", discarded_input, "Looking up", None, tool_call
+    )
+    discarded.tools = [ToolInfo(name="lookup", description="Look up an answer")]
+    continued = linked_call("continued", "agent", continued_input, "Done", None)
+    events: list[Event] = [
+        SpanBeginEvent(id="agent", name="agent", type="agent"),
+        first,
+        *([kept] if shape == "candidate" else []),
+        discarded,
+        SpanBeginEvent(
+            id="tool-discarded", name="lookup", type="tool", parent_id="agent"
+        ),
+        imported_tool_event(tool_call, 0, "tool-discarded"),
+        SpanEndEvent(id="tool-discarded"),
+        *([kept] if shape == "fork" else []),
+        continued,
+        SpanEndEvent(id="agent"),
+    ]
+
+    def replay(recorded: bool) -> list[ReplayStep]:
+        chosen = [
+            event.model_copy(update={"origin": "agent"})
+            if recorded and isinstance(event, ModelEvent)
+            else event
+            for event in events
+        ]
+        pool: list[ChatMessage] = []
+        if inputs == "pooled":
+            chosen, pool = _replay._condensed(chosen, [])
+        return steps_from_events(
+            [],
+            chosen,
+            pool,
+            sample_uuid="sample",
+            eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=False),
+        )
+
+    inferred = replay(False)
+    recorded = replay(True)
+    assert "discarded" not in [s.id for s in inferred if s.stage == "model_input"]
+    assert (
+        tool_steps(inferred)
+        == tool_steps(recorded)
+        == [
+            ("tool_call", "discarded-tool", "lookup", {}, None),
+            (
+                "tool_result",
+                "discarded-tool",
+                "lookup",
+                {},
+                "result of discarded-tool in turn 0",
+            ),
+        ]
+    )
+    # Inferred conversation history omits the discarded generate. Other
+    # tool-stage fields match after ignoring regenerated message ids.
+    assert not [
+        f.name
+        for ours, theirs in zip(
+            [s for s in inferred if s.stage.startswith("tool")],
+            [s for s in recorded if s.stage.startswith("tool")],
+        )
+        for f in dataclasses.fields(ours.step)
+        if f.name != "history"
+        and comparable(getattr(ours.step, f.name), ids=False)
+        != comparable(getattr(theirs.step, f.name), ids=False)
+    ]
+
+
+def side_calls(
+    count: int, span_id: str | None, origin: str | None, tooled: bool
+) -> list[ModelEvent]:
+    """`count` calls, each but the first carrying on the one before it; `tooled`, each makes a tool call under a system prompt of its own."""
+    input: list[ChatMessage] = [ChatMessageUser(content="Grade the answer.")]
+    if tooled:
+        input.insert(0, ChatMessageSystem(content="You are a grader."))
+    calls: list[ModelEvent] = []
+    for n in range(count):
+        look = [ToolCall(id=f"g{n}", function="look", arguments={})] if tooled else []
+        call = linked_call(f"s{n}", span_id, input, f"Graded {n}.", origin, *look)
+        calls.append(call)
+        input = [*input, call.output.message, ChatMessageUser(content="Go on.")]
+    return calls
+
+
+def region_with_side_calls(
+    region: str, count: int, recorded: bool, tooled: bool
+) -> tuple[list[ChatMessage], list[Event]]:
+    """An agent's turns and `count` linked calls in a scorer, sentinel, or tool region. `tooled` gives the agent and helper calls different system prompts."""
+    agent = "agent" if recorded else None
+    opening: list[ChatMessage] = [ChatMessageUser(content="Solve it.")]
+    if tooled:
+        opening.insert(0, ChatMessageSystem(content="You are a solver."))
+    if region == "tool":
+        call = ToolCall(id="c1", function="check", arguments={})
+        m1 = linked_call("m1", "agent", opening, "Checking.", agent, call)
+        result = ChatMessageTool(content="ok", tool_call_id="c1", function="check")
+        m2 = linked_call(
+            "m2", "agent", [*opening, m1.output.message, result], "Solved.", agent
+        )
+        helpers = side_calls(count, "tool-c1", "tool" if recorded else None, tooled)
+        events = solving(
+            [
+                SpanBeginEvent(id="agent", name="agent", type="agent"),
+                m1,
+                SpanBeginEvent(
+                    id="tool-c1", name="check", type="tool", parent_id="agent"
+                ),
+                *helpers,
+                ToolEvent(
+                    id="c1",
+                    function="check",
+                    arguments={},
+                    result="ok",
+                    span_id="tool-c1",
+                ),
+                SpanEndEvent(id="tool-c1"),
+                m2,
+                SpanEndEvent(id="agent"),
+            ]
+        )
+        return [*opening, m1.output.message, result, m2.output.message], events
+    m1 = linked_call("m1", "agent", opening, "Solved.", agent)
+    messages: list[ChatMessage] = [*opening, m1.output.message]
+    if region == "scorer":
+        graders = side_calls(count, "match", "scorer" if recorded else None, tooled)
+        m1.span_id = None
+        return messages, [
+            *solving([m1]),
+            SpanBeginEvent(id="scorers", name="scorers", type="scorers"),
+            SpanBeginEvent(
+                id="match", name="match", type="scorer", parent_id="scorers"
+            ),
+            *graders,
+            SpanEndEvent(id="match"),
+            SpanEndEvent(id="scorers"),
+        ]
+    monitors = side_calls(count, "check", "helper" if recorded else None, tooled)
+    return (
+        messages,
+        solving(
+            [
+                SpanBeginEvent(id="agent", name="agent", type="agent"),
+                m1,
+                SpanBeginEvent(
+                    id="check", name="probe", type="sentinel", parent_id="agent"
+                ),
+                *monitors,
+                SpanEndEvent(id="check"),
+                SpanEndEvent(id="agent"),
+            ]
+        ),
+    )
+
+
+@pytest.mark.parametrize("tooled", [False, True])
+@pytest.mark.parametrize("count", [1, 2, 3])
+@pytest.mark.parametrize("region", ["scorer", "sentinel", "tool"])
+def test_linked_calls_outside_the_agent_s_turns_leave_its_turns(
+    region: str, count: int, tooled: bool
+) -> None:
+    # Ransom's sixth review B1: calls a region shows are not the agent's (a
+    # scorer's, a sentinel's, or a tool's) are left out of continuity, so
+    # linked ones cannot make
+    # the agent's turn utility; replay without origins gives the steps it
+    # gives with them. Review 7 B1: tool-calling ones under another system
+    # prompt cannot set the prompt the agent's turns are classified by
+    def steps(recorded: bool) -> list[tuple[str, str]]:
+        messages, events = region_with_side_calls(region, count, recorded, tooled)
+        return [
+            (s.stage, s.id)
+            for s in steps_from_events(
+                messages,
+                events,
+                [],
+                sample_uuid="sample",
+                eval_info=EvalInfo(inspect_ai_version="0.3.200", sentinel=False),
+            )
+        ]
+
+    inferred = steps(recorded=False)
+
+    assert inferred == steps(recorded=True)
+    assert ("model_input", "m1") in inferred
+    assert not any(id.startswith("s") for _, id in inferred)
 
 
 @solver
@@ -2162,6 +6555,74 @@ def test_a_refusal_raised_under_fail_on_refusal_has_no_after_step() -> None:
         ),
     )
     assert [s.stage for s in replay] == ["model_input", "model_input", "model_output"]
+
+
+@solver
+def r7_continues_after_a_retried_refusal() -> Solver:
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        model = get_model()
+        try:
+            await model.generate(
+                state.messages, config=GenerateConfig(fail_on_refusal=True)
+            )
+        except ModelRefusalError:
+            pass
+        output = await model.generate(state.messages)
+        state.messages.extend([output.message, ChatMessageUser(content="And 2 + 2?")])
+        state.output = await model.generate(state.messages)
+        return state
+
+    return solve
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+def test_a_refusal_raised_under_fail_on_refusal_is_a_failed_call_in_continuity(
+    inputs: str,
+) -> None:
+    # Ransom's review 26 B1: a refused call R, its retry S on the same input,
+    # then a call continuing S; without origins continuity took R's refusal
+    # as an answer and made R utility, dropping its model_input step
+    from inspect_ai._sentinel import _replay
+
+    model = outputs(
+        ModelOutput.from_content(
+            "mockllm/model", "I refuse", stop_reason="content_filter"
+        ),
+        done("2"),
+        done(),
+    )
+    seen: dict[str, Step] = {}
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=r7_continues_after_a_retried_refusal(),
+        sentinel=[r7_probe(seen, copies=True)],
+    )
+    log = eval(task, model=model)[0]
+    assert log.status == "success", log.error
+    recorded = assert_logged_replay_equals_live(log, seen)
+    assert [s.stage for s in recorded] == [
+        "model_input",
+        "model_input",
+        "model_output",
+        "model_input",
+        "model_output",
+    ]
+    sample = logged_sample(log)
+    refused = next(e for e in sample.events if isinstance(e, ModelEvent))
+    assert refused.output.stop_reason == "content_filter"
+    events: list[Event] = without_origins(sample.events)
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    inferred = steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(log.eval),
+    )
+    assert [(s.stage, s.id) for s in inferred] == [(s.stage, s.id) for s in recorded]
+    assert ("model_input", refused.uuid) in [(s.stage, s.id) for s in inferred]
 
 
 def test_a_superseded_human_decision_is_withdrawn(
@@ -2199,26 +6660,17 @@ def test_a_superseded_human_decision_is_withdrawn(
 @pytest.mark.parametrize(
     "version,truncated",
     [
-        ("0.3.30", None),
-        ("0.3.31.dev1", None),
-        ("0.3.31rc1", None),
-        ("0.3.31a1.post1", None),
-        ("0.3.31", False),
-        ("0.3.31.0", False),
-        ("0.3.31+g5ea5c5ce1", False),
-        ("0.3.31.post1.dev1", False),
-        ("0.3.4", None),
+        (None, None),
+        ("0.3.100", False),
+        ("0.3.262.dev32+g5ea5c5ce1", False),
         ("0.4", False),
         ("1!0.1", False),
-        ("0.3.262.dev32+g5ea5c5ce1", False),
-        # a version that does not parse is taken as current, as packaging's
-        # InvalidVersion was
+        # a version that does not parse is taken as current
         ("unknown", False),
-        ("0.3.30garbage", False),
     ],
 )
-def test_a_log_from_before_the_record_of_cuts_says_it_cannot_tell(
-    version: str, truncated: bool | None
+def test_a_log_without_a_version_cannot_tell_whether_output_was_cut(
+    version: str | None, truncated: bool | None
 ) -> None:
     log = run_logged(tool_loop(addition()), agent_model())
     sample = logged_sample(log)
@@ -2266,6 +6718,184 @@ def test_an_approvers_view_replays_whole() -> None:
     assert before.view.context.content == "adding for the user"
 
 
+class ClickOptions(BaseModel):
+    button: str = "left"
+
+
+def r7_click_viewer(call: ToolCall) -> ToolCallView:
+    """A context that depends on the call's arguments: the page, with the element clicked marked."""
+    element_id = call.arguments.get("element_id")
+    page = [
+        f"{'*' if n == element_id else ' '} [{n}] button 'item {n}'"
+        for n in range(1, 9)
+    ]
+    return ToolCallView(context=ToolCallContent(format="text", content="\n".join(page)))
+
+
+@tool(viewer=r7_click_viewer)
+def r7_click() -> Tool:
+    async def execute(element_id: int, options: ClickOptions | None = None) -> str:
+        """Click an element.
+
+        Args:
+            element_id: ID of the element to click.
+            options: How to click it.
+        """
+        return f"clicked {element_id}"
+
+    return execute
+
+
+@approver
+def r7_clicks(decision: str, element_id: int) -> Approver:
+    async def approve(
+        message: str, call: ToolCall, view: ToolCallView, history: list[ChatMessage]
+    ) -> Approval:
+        if decision == "modify":
+            return Approval(
+                decision="modify",
+                modified=replace(
+                    call, arguments={**call.arguments, "element_id": element_id}
+                ),
+            )
+        return Approval(decision="approve")
+
+    return approve
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("origins", [True, False])
+@pytest.mark.parametrize("decision", ["approve", "modify"])
+@pytest.mark.parametrize("changed", [False, True])
+def test_an_approvals_context_replays_only_for_the_call_it_viewed(
+    inputs: str, origins: bool, decision: str, changed: bool
+) -> None:
+    """An approval's view is of the call it was shown; a changed call's context is not recorded."""
+    from inspect_ai._sentinel import _replay
+
+    seen: dict[str, Step] = {}
+    task = Task(
+        dataset=[Sample(input="Click item 1", target="")],
+        solver=tool_loop(r7_click()),
+        sentinel=[r7_probe(seen, copies=True)],
+        approval=[
+            ApprovalPolicy(
+                r7_clicks("modify" if changed else decision, 7 if changed else 1),
+                "*",
+            )
+        ],
+    )
+    model = outputs(call("r7_click", element_id=1, options={}), done())
+    log = eval(task, model=model)[0]
+    assert log.status == "success", log.error
+    assert_logged_replay_equals_live(log, seen)
+    sample = logged_sample(log)
+    [(_, live)] = [
+        (key, step)
+        for key, step in live_steps(sample, seen).items()
+        if key[0] == "tool_call"
+    ]
+    assert live.view.context is not None
+    clicked = "7" if changed else "1"
+    assert f"* [{clicked}] button" in live.view.context.content
+
+    # with `changed`, an approve whose call differs from the one that ran is a
+    # synthetic log (live refuses it); it shows the decision does not matter
+    events: list[Event] = [
+        event.model_copy(update={"decision": decision})
+        if isinstance(event, ApprovalEvent)
+        else event
+        for event in (sample.events if origins else without_origins(sample.events))
+    ]
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    replay = steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(log.eval),
+    )
+    [before] = [s.step for s in replay if isinstance(s.step, BeforeToolCall)]
+    # validation fills in the options' defaults before the approver sees the call
+    assert before.call.arguments == {
+        "element_id": int(clicked),
+        "options": {"button": "left"},
+    }
+    if changed:
+        assert before.view.context is None
+    else:
+        assert comparable(before.view.context) == comparable(live.view.context)
+
+
+@protocol
+def r7_clicks_elsewhere() -> Protocol:
+    async def rewrite(
+        context: Context, step: BeforeToolCall, escalations: Escalations
+    ) -> Decision | None:
+        modified = replace(
+            step.call, arguments={**step.call.arguments, "element_id": 3}
+        )
+        return Decision(action="modify", modified=modified, explanation="elsewhere")
+
+    return rewrite
+
+
+@pytest.mark.parametrize("inputs", ["expanded", "pooled"])
+@pytest.mark.parametrize("origins", [True, False])
+def test_an_approvals_view_replays_when_only_a_sentinel_changes_the_call(
+    inputs: str, origins: bool
+) -> None:
+    # Ransom's review 31 B2: the approver approves the call unchanged, then a
+    # sentinel modifies it; the before-tool stage was handed the approval's view
+    from inspect_ai._sentinel import _replay
+
+    seen: dict[str, Step] = {}
+    task = Task(
+        dataset=[Sample(input="Click item 1", target="")],
+        solver=tool_loop(r7_click()),
+        sentinel=[r7_probe(seen, copies=True), r7_clicks_elsewhere()],
+        approval=[ApprovalPolicy(r7_clicks("approve", 1), "*")],
+    )
+    model = outputs(call("r7_click", element_id=1, options={}), done())
+    log = eval(task, model=model)[0]
+    assert log.status == "success", log.error
+    sample = logged_sample(log)
+    [tool_event] = [e for e in sample.events if isinstance(e, ToolEvent)]
+    assert tool_event.arguments["element_id"] == 3
+    [(_, live)] = [
+        (key, step)
+        for key, step in live_steps(sample, seen).items()
+        if key[0] == "tool_call"
+    ]
+    assert live.view.context is not None
+    assert "* [1] button" in live.view.context.content
+    assert_logged_replay_equals_live(log, seen)
+
+    events: list[Event] = list(
+        sample.events if origins else without_origins(sample.events)
+    )
+    pool: list[ChatMessage] = []
+    if inputs == "pooled":
+        events, pool = _replay._condensed(events, [])
+    adapter = TypeAdapter(list[Event])
+    events = adapter.validate_json(adapter.dump_json(events))
+    replay = steps_from_events(
+        sample.messages,
+        events,
+        pool,
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(log.eval),
+    )
+    [before] = [s.step for s in replay if isinstance(s.step, BeforeToolCall)]
+    assert before.call.arguments["element_id"] == 1
+    assert comparable(before.view.context) == comparable(live.view.context)
+    assert comparable(before.view.call) == comparable(live.view.call)
+
+
 def test_a_result_is_the_message_the_tool_event_names() -> None:
     from inspect_ai._sentinel._replay import _Driver
 
@@ -2278,6 +6908,27 @@ def test_a_result_is_the_message_the_tool_event_names() -> None:
     unknown = event.model_copy(update={"message_id": "m2", "result": "rebuilt"})
     rebuilt = driver._result(unknown)
     assert (rebuilt.id, rebuilt.text) == ("m2", "rebuilt")
+
+
+@pytest.mark.parametrize("ran, edited", [(1, True), (0, False), (0, 1)])
+def test_a_result_is_the_copy_the_call_returned(ran: int, edited: int | bool) -> None:
+    """Of a tool message's copies under one id, the result is the one equal to the call's, by JSON."""
+    from inspect_ai._sentinel._replay import _Driver
+
+    def text(value: int | bool) -> ContentText:
+        return ContentText(text="ok", internal={"n": value})
+
+    def copy(value: int | bool) -> ChatMessageTool:
+        return ChatMessageTool(
+            id="m1", content=[text(value)], tool_call_id="c1", function="f"
+        )
+
+    edit, original = copy(edited), copy(ran)
+    driver = _Driver([], [], [edit, original], "sample", EvalInfo(None, True), None, ())
+    event = ToolEvent(
+        id="c1", function="f", arguments={}, result=[text(ran)], message_id="m1"
+    )
+    assert driver._result(event) is original
 
 
 def nudged_inputs(turns: int) -> list[Event]:
@@ -2442,7 +7093,7 @@ def test_batches_that_overlap_replay_as_they_ran(
         anyio.Event(),
     )
     tools = [synchronised(a1_started, b1_started, a2_started, b_done)]
-    replay = assert_replay_equals_live(
+    log = run_logged(
         r7_runs_batches_concurrently(tools, a1_started, b_done),
         outputs(
             calls(
@@ -2453,8 +7104,16 @@ def test_batches_that_overlap_replay_as_they_ran(
             calls(("synchronised", {"kind": "B1"}), turn=2),
             done("C"),
         ),
+        # two threads in one span: continuity follows the one carried on, so
+        # without origins the other's turn is utility
+        inferred="two threads in one conversation",
     )
-    assert len([s for s in replay if s.stage == "tool_result"]) == 3
+    sample = logged_sample(log)
+    recorded = replay_events(log, sample.events)
+    inferred = replay_events(log, without_origins(sample.events))
+    assert tool_steps(inferred) == tool_steps(recorded)
+    assert len([s for s in inferred if s.stage == "tool_call"]) == 3
+    assert len([s for s in inferred if s.stage == "tool_result"]) == 3
 
 
 def inserted_block_inputs(turns: int) -> tuple[list[ModelEvent], list[ChatMessage]]:
@@ -2687,3 +7346,2471 @@ def test_parallel_on_start_sub_agent_calls_replay_with_their_histories(
         sub_input, sub_output = by_conversation[conversation]
         assert [m.text for m in sub_output.step.history or []] == [text]
         assert parents[("model_input", sub_input.id)] == conversation
+
+
+def test_a_person_s_approval_of_a_bridged_host_call_reaches_later_turns() -> None:
+    log = run_logged(
+        as_solver(r7_bridged_scaffold("report")),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="host",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            done(),
+        ),
+        approval=[ApprovalPolicy(r7_decides("approve"), "*")],
+    )
+    sample = logged_sample(log)
+    [approver_name] = {
+        e.approver for e in sample.events if isinstance(e, ApprovalEvent)
+    }
+    replay = steps_from_events(
+        sample.messages,
+        sample.events,
+        [],
+        sample_uuid=sample.uuid or "",
+        eval_info=EvalInfo.from_eval(log.eval),
+        human_approvers=(approver_name,),
+    )
+    # replay skips the host call's tool steps, but the turn after it sees the
+    # person's approval
+    assert [s.stage for s in replay] == ["model_input", "model_output"] * 2
+    [decision] = replay[2].step.human_decisions or []
+    assert (decision.step_id, decision.decided.report.action) == ("host", "proceed")
+
+
+async def r7_host_bridge(state: AgentState) -> tuple[Any, list[Any]]:
+    """A sandbox bridge serving `addition` on the host, and the scaffold's declaration of it."""
+    from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
+
+    bridge = SandboxAgentBridge(
+        state=state,
+        filter=None,
+        retry_refusals=None,
+        compaction=None,
+        port=8080,
+        model=None,
+        bridged_tools={"host": {"addition": addition()}},
+    )
+    [served] = bridge.served_tools.values()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "mcp__host__addition",
+                "description": served.description,
+                "parameters": served.parameters.model_dump(exclude_none=True),
+            },
+        }
+    ]
+    return bridge, tools
+
+
+@agent
+def r7_defers_a_bridged_host_call(
+    native_first: bool, native: str = "addition"
+) -> Agent:
+    """A bridged call proposed, then a native call (`addition`, or `explodes`, which raises) generated under its id, before either runs."""
+
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+        from inspect_ai.agent._bridge.sandbox.service import call_tool
+
+        bridge, tools = await r7_host_bridge(state)
+        messages = [{"role": "user", "content": "What is 1 + 1?"}]
+        completion = await inspect_completions_api_request(
+            {"model": "inspect", "messages": messages, "tools": tools}, None, bridge
+        )
+        [proposed] = completion.choices[0].message.tool_calls or []
+        assert proposed.type == "function"
+        native_tools = (
+            [addition(), explodes()]
+            if native == "both"
+            else [explodes() if native == "explodes" else addition()]
+        )
+        history: list[ChatMessage] = [ChatMessageUser(content="What is 5 + 5?")]
+        output = await get_model().generate(history, tools=native_tools)
+        history.append(output.message)
+
+        async def host() -> None:
+            # the bridge checks the result when the next request carries it
+            result = await call_tool(bridge)(
+                "host", "addition", json.loads(proposed.function.arguments)
+            )
+            await inspect_completions_api_request(
+                {
+                    "model": "inspect",
+                    "messages": [
+                        *messages,
+                        completion.choices[0].message.model_dump(exclude_none=True),
+                        {
+                            "role": "tool",
+                            "tool_call_id": proposed.id,
+                            "content": str(result),
+                        },
+                    ],
+                    "tools": tools,
+                },
+                None,
+                bridge,
+            )
+
+        async def native_call() -> None:
+            try:
+                await execute_tools(history, native_tools)
+            except RuntimeError:
+                assert native in ("explodes", "both")
+
+        for step in (native_call, host) if native_first else (host, native_call):
+            await step()
+        return state
+
+    return execute
+
+
+@pytest.mark.parametrize("native_first", [False, True])
+def test_a_native_call_run_while_a_bridged_call_waits_keeps_its_tool_steps(
+    native_first: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_defers_a_bridged_host_call(native_first)),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            r7_tool_calls(
+                ToolCall(id="shared", function="addition", arguments={"x": 5, "y": 5})
+            ),
+            done(),
+        ),
+        sentinel=[r7_probe(seen, copies=True)],
+        # the bridge's request reporting the result follows the native turn
+        inferred="two threads in one conversation",
+    )
+    live = [
+        ((e.stage, e.step_id), seen[e.explanation or ""])
+        for e in logged_sample(log).events
+        if isinstance(e, SentinelEvent) and e.path == "r7_probe"
+    ]
+    # the bridge checked the call before the native call was generated, and
+    # its result, once reported, around the native call's checks
+    bridged = [
+        n
+        for n, (_, step) in enumerate(live)
+        if isinstance(step, BeforeToolCall | AfterToolCall)
+        and step.call.arguments == {"x": 1, "y": 1}
+    ]
+    native = [
+        n
+        for n, (_, step) in enumerate(live)
+        if isinstance(step, BeforeToolCall | AfterToolCall)
+        and step.call.arguments == {"x": 5, "y": 5}
+    ]
+    [_, turn, _] = [n for n, (key, _) in enumerate(live) if key[0] == "model_input"]
+    assert bridged[0] < turn < native[0]
+    assert (bridged[1] > native[1]) is native_first
+    replay = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.arguments == {"x": 5, "y": 5}
+    )
+    assert len(tool_step_calls(replay)) == 2
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+@agent
+def r9_native_before_a_filtered_bridge_call() -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+
+        native_tool = addition()
+        history: list[ChatMessage] = [ChatMessageUser(content="native")]
+        output = await get_model().generate(history, tools=[native_tool])
+        history.append(output.message)
+
+        bridge, tools = await r7_host_bridge(state)
+
+        async def replace_response(
+            model: Any, output: ModelOutput, generate_input: Any
+        ) -> ModelOutput | None:
+            if not output.message.tool_calls:
+                return None
+            return r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            )
+
+        bridge.response_filter = replace_response
+        await inspect_completions_api_request(
+            {
+                "model": "inspect",
+                "messages": [{"role": "user", "content": "bridge"}],
+                "tools": tools,
+            },
+            None,
+            bridge,
+        )
+        await inspect_completions_api_request(
+            {
+                "model": "inspect",
+                "messages": [{"role": "user", "content": "INTERLEAVED"}],
+            },
+            None,
+            bridge,
+        )
+        await execute_tools(history, [native_tool])
+        return state
+
+    return execute
+
+
+def test_a_native_call_under_a_filtered_bridge_proposal_s_id_keeps_its_tool_steps(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r9_native_before_a_filtered_bridge_call()),
+        outputs(
+            r7_tool_calls(
+                ToolCall(id="shared", function="addition", arguments={"x": 5, "y": 5})
+            ),
+            r7_tool_calls(
+                ToolCall(
+                    id="raw", function="mcp__host__addition", arguments={"x": 1, "y": 1}
+                )
+            ),
+            done("INTERLEAVED"),
+        ),
+        sentinel=[r7_probe(seen, copies=True)],
+    )
+    events = logged_sample(log).events
+    live = [
+        seen[event.explanation or ""]
+        for event in events
+        if isinstance(event, SentinelEvent)
+        and event.path == "r7_probe"
+        and event.stage == "tool_call"
+    ]
+    native = next(step for step in live if step.call.arguments == {"x": 5, "y": 5})
+    native_report = next(
+        i
+        for i, event in enumerate(events)
+        if isinstance(event, SentinelEvent)
+        and event.path == "r7_probe"
+        and event.stage == "tool_call"
+        and seen[event.explanation or ""].call.arguments == {"x": 5, "y": 5}
+    )
+    interleaved_event = next(
+        i
+        for i, event in enumerate(events)
+        if isinstance(event, ModelEvent) and event.output.message.text == "INTERLEAVED"
+    )
+    assert native_report > interleaved_event
+    assert any(message.text == "INTERLEAVED" for message in native.history)
+
+    steps = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.arguments == {"x": 5, "y": 5}
+    )
+    assert [(stage, args) for stage, _, args in tool_step_calls(steps)] == [
+        ("tool_call", {"x": 5, "y": 5}),
+        ("tool_result", {"x": 5, "y": 5}),
+    ]
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+@agent(name="r10_handoff", description="Handle the requested task.")
+def r10_handoff() -> Agent:
+    async def execute(state: AgentState, task: str) -> AgentState:
+        """Handle a task.
+
+        Args:
+            state: Agent state.
+            task: Task to handle.
+        """
+        state.messages.append(ChatMessageAssistant(content=task))
+        return state
+
+    return execute
+
+
+@protocol
+def r10_modify_handoff() -> Protocol:
+    async def modify(
+        context: Context, step: BeforeToolCall, escalations: Escalations
+    ) -> Decision | None:
+        if step.call.function == "transfer_to_r10_handoff":
+            return Decision(
+                action="modify",
+                modified=replace(step.call, arguments={"task": "modified"}),
+            )
+        return None
+
+    return modify
+
+
+@agent
+def r10_bridged_proposal_before_native_handoff() -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+
+        bridge, tools = await r7_host_bridge(state)
+        await inspect_completions_api_request(
+            {
+                "model": "inspect",
+                "messages": [{"role": "user", "content": "bridge"}],
+                "tools": tools,
+            },
+            None,
+            bridge,
+        )
+        handoff_tool = handoff(r10_handoff())
+        history: list[ChatMessage] = [ChatMessageUser(content="native")]
+        output = await get_model().generate(history, tools=[handoff_tool])
+        history.append(output.message)
+        await execute_tools(history, [handoff_tool])
+        return state
+
+    return execute
+
+
+@pytest.mark.parametrize("case", ["modify", "human"])
+def test_a_native_handoff_under_a_bridged_call_s_id_keeps_its_tool_steps(
+    case: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen: dict[str, Step] = {}
+    sentinel: list[Any] = [r7_probe(seen, copies=True)]
+    if case == "modify":
+        sentinel.append(r10_modify_handoff())
+    else:
+        Panel("approve", "handoff approved").install(monkeypatch)
+        sentinel.append(h_ask("tool_call", ["approve", "reject"]))
+    log = run_logged(
+        as_solver(r10_bridged_proposal_before_native_handoff()),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="transfer_to_r10_handoff",
+                    arguments={"task": "original"},
+                )
+            ),
+        ),
+        sentinel=sentinel,
+    )
+    events = logged_sample(log).events
+    live = [
+        seen[event.explanation or ""]
+        for event in events
+        if isinstance(event, SentinelEvent)
+        and event.path == "r7_probe"
+        and event.stage == "tool_call"
+    ]
+    native = next(
+        step for step in live if step.call.function == "transfer_to_r10_handoff"
+    )
+    replay = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.function == "transfer_to_r10_handoff"
+    )
+    rebuilt = [step for step in replay if step.stage in ("tool_call", "tool_result")]
+    assert native.call.arguments == {"task": "original"}
+    if case == "modify":
+        assert any(
+            isinstance(event, SentinelEvent)
+            and event.action == "modify"
+            and event.modified is not None
+            and event.modified.arguments == {"task": "modified"}
+            for event in events
+        )
+    else:
+        assert any(
+            isinstance(event, SentinelEvent)
+            and event.factory == "inspect_sentinel/human"
+            and event.explanation == "handoff approved"
+            for event in events
+        )
+    assert rebuilt[0].stage == "tool_call"
+    assert dict(rebuilt[0].recorded_answers) == (
+        {}
+        if case == "modify"
+        else {"human": HumanAnswer(decision="approve", reason="handoff approved")}
+    )
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+@agent
+def r11_helper_handoff_after_bridge(native_origin: str) -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+
+        bridge, tools = await r7_host_bridge(state)
+        request = {
+            "model": "inspect",
+            "messages": [{"role": "user", "content": "bridge"}],
+            "tools": tools,
+        }
+        await inspect_completions_api_request(request, None, bridge)
+        handoff_tool = handoff(r10_handoff())
+        history: list[ChatMessage] = [ChatMessageUser(content="native helper")]
+        if native_origin == "agent":
+            output = await get_model().generate(history, tools=[handoff_tool])
+        else:
+            with model_origin("helper"):
+                output = await get_model().generate(history, tools=[handoff_tool])
+        history.append(output.message)
+
+        async def replace_response(
+            model: Any, output: ModelOutput, generate_input: Any
+        ) -> ModelOutput:
+            return r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 2, "y": 2},
+                )
+            )
+
+        bridge.response_filter = replace_response
+        await inspect_completions_api_request(request, None, bridge)
+        with model_origin("helper"):
+            await execute_tools(history, [handoff_tool])
+        return state
+
+    return execute
+
+
+@pytest.mark.parametrize("native_origin", ["agent", "helper"])
+@pytest.mark.parametrize("human", [False, True])
+def test_a_helper_handoff_never_takes_a_bridge_check(
+    human: bool,
+    native_origin: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: dict[str, Step] = {}
+    sentinel: list[Any] = [r7_probe(seen, copies=True)]
+    if human:
+        Panel("approve", "bridge approved").install(monkeypatch)
+        sentinel.append(h_ask("tool_call", ["approve", "reject"]))
+    log = run_logged(
+        as_solver(r11_helper_handoff_after_bridge(native_origin)),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="transfer_to_r10_handoff",
+                    arguments={"task": "helper original"},
+                )
+            ),
+            r7_tool_calls(
+                ToolCall(
+                    id="raw",
+                    function="mcp__host__addition",
+                    arguments={"x": 2, "y": 2},
+                )
+            ),
+        ),
+        sentinel=sentinel,
+        # a model_origin() region is not in the span tree, so without origins
+        # the helper's call is a turn
+        inferred="a model_origin() region" if native_origin == "helper" else None,
+    )
+    live = [step for step in seen.values() if isinstance(step, BeforeToolCall)]
+    assert not any(step.call.function == "transfer_to_r10_handoff" for step in live)
+    all_replay = replayed(log)
+    replay = [step for step in all_replay if step.stage == "tool_call"]
+    native = [
+        step
+        for step in replay
+        if isinstance(step.step, BeforeToolCall)
+        and step.step.call.function == "transfer_to_r10_handoff"
+    ]
+    if human:
+        assert any(
+            decision.step_id == "shared"
+            for step in all_replay
+            for decision in step.step.human_decisions or []
+        )
+    # live checks a call by the region that runs it, replay by its producer's
+    # (a known difference), so a handoff a turn proposed has a step with no
+    # check of its own
+    assert len(native) == (1 if native_origin == "agent" else 0)
+    assert not any(step.recorded_answers for step in native)
+    # the filter's other call under the id is handed over under a fresh one
+    warned = bridge_warning_ids(caplog)
+    assert warned[0] == "shared" and len(warned) == 2
+
+
+@agent
+def r11_prefilled_after_filtered_bridge(native_id: str) -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+
+        bridge, tools = await r7_host_bridge(state)
+
+        async def replace_response(
+            model: Any, output: ModelOutput, generate_input: Any
+        ) -> ModelOutput:
+            return r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            )
+
+        bridge.response_filter = replace_response
+        await inspect_completions_api_request(
+            {
+                "model": "inspect",
+                "messages": [{"role": "user", "content": "bridge"}],
+                "tools": tools,
+            },
+            None,
+            bridge,
+        )
+        state.messages.append(
+            ChatMessageAssistant(
+                content="prefilled",
+                tool_calls=[
+                    ToolCall(
+                        id=native_id, function="addition", arguments={"x": 5, "y": 5}
+                    )
+                ],
+            )
+        )
+        await execute_tools(state.messages, [addition()])
+        return state
+
+    return execute
+
+
+@pytest.mark.parametrize("human", [False, True])
+@pytest.mark.parametrize("native_id", ["shared", "native"])
+def test_a_prefilled_native_call_beside_a_bridge_keeps_its_tool_steps(
+    human: bool,
+    native_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: dict[str, Step] = {}
+    sentinel: list[Any] = [r7_probe(seen, copies=True)]
+    if human:
+        Panel("approve", "approved").install(monkeypatch)
+        sentinel.append(h_ask("tool_call", ["approve", "reject"]))
+    log = run_logged(
+        as_solver(r11_prefilled_after_filtered_bridge(native_id)),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="raw",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            )
+        ),
+        sentinel=sentinel,
+    )
+    live = [
+        step
+        for step in seen.values()
+        if isinstance(step, BeforeToolCall)
+        and step.call.function == "addition"
+        and step.call.arguments == {"x": 5, "y": 5}
+    ]
+    assert len(live) == 1 and live[0].input is None
+    replay = replayed(log)
+    native_steps = [
+        step for step in replay if step.stage in ("tool_call", "tool_result")
+    ]
+    # under the bridge's id or its own
+    assert [step.stage for step in native_steps] == ["tool_call", "tool_result"]
+    assert isinstance(native_steps[0].step, BeforeToolCall)
+    assert native_steps[0].step.call.arguments == live[0].call.arguments
+    if human:
+        assert dict(native_steps[0].recorded_answers) == {
+            "human": HumanAnswer(decision="approve", reason="approved")
+        }
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+def test_a_native_result_check_inside_its_invocation_is_replayed() -> None:
+    log = run_logged(
+        as_solver(r7_defers_a_bridged_host_call(native_first=True, native="both")),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            r7_tool_calls(
+                ToolCall(
+                    id="native_ok", function="addition", arguments={"x": 5, "y": 5}
+                ),
+                ToolCall(id="shared", function="explodes", arguments={}),
+            ),
+        ),
+        sentinel=[r7_probe({}), r7_bridge_result_outcome("terminate")],
+    )
+    native_results = [
+        step.step for step in replayed(log) if isinstance(step.step, AfterToolCall)
+    ]
+    assert len(native_results) == 1
+    assert native_results[0].call.id == "native_ok"
+    assert native_results[0].result.text == "10"
+
+
+@reviewer
+def r7_reviewer_logs_a_model_call() -> Reviewer:
+    async def review_result(
+        message: str,
+        call: ToolCall,
+        result: ChatMessageTool,
+        output: ToolResult,
+        view: ToolCallView,
+        history: list[ChatMessage],
+    ) -> Review:
+        await get_model("mockllm/reviewer").generate("Review this result")
+        return Review(decision="continue")
+
+    return review_result
+
+
+def test_a_native_result_check_follows_an_interleaved_reviewer_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inspect_ai._sentinel import _replay
+
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_defers_a_bridged_host_call(native_first=True, native="both")),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="host",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            r7_tool_calls(
+                ToolCall(
+                    id="native_ok", function="addition", arguments={"x": 5, "y": 5}
+                ),
+                ToolCall(id="other", function="explodes", arguments={}),
+            ),
+        ),
+        sentinel=[r7_probe(seen, copies=True), r7_bridge_result_outcome("terminate")],
+        review=[ReviewPolicy(r7_reviewer_logs_a_model_call(), "addition")],
+        # a reviewer's model call is not in a tool span, so without origins it
+        # is a turn, as an approver's is
+        inferred="a reviewer's model call",
+    )
+    sample = logged_sample(log)
+    [recorded_span] = [
+        event.span_id
+        for event in sample.events
+        if isinstance(event, SentinelEvent)
+        and event.stage == "tool_result"
+        and event.step_id == "native_ok"
+        and event.path == "r7_probe"
+    ]
+    assert recorded_span is not None
+    reviewer_event = next(
+        index
+        for index, event in enumerate(sample.events)
+        if isinstance(event, ModelEvent) and event.model == "mockllm/reviewer"
+    )
+    result_begin = next(
+        index
+        for index, event in enumerate(sample.events)
+        if isinstance(event, SpanBeginEvent) and event.id == recorded_span
+    )
+    tool_event = next(
+        index
+        for index, event in enumerate(sample.events)
+        if isinstance(event, ToolEvent) and event.id == "native_ok"
+    )
+    tool_begin = sample.events[tool_event - 1]
+    assert isinstance(tool_begin, SpanBeginEvent) and tool_begin.type == "tool"
+    tool_span = tool_begin.id
+    tool_end = next(
+        index
+        for index, event in enumerate(sample.events)
+        if isinstance(event, SpanEndEvent) and event.id == tool_span
+    )
+    assert tool_end < reviewer_event < result_begin
+    selected: list[tuple[str, str | None]] = []
+    built = _replay._Driver._built
+
+    def record(
+        self: Any, step_id: str, stage: SentinelStage, step: Step, span: str | None
+    ) -> None:
+        if stage == "tool_result":
+            selected.append((step_id, span))
+        built(self, step_id, stage, step, span)
+
+    monkeypatch.setattr(_replay._Driver, "_built", record)
+    replayed(log)
+    assert selected == [("native_ok", recorded_span)]
+
+
+@protocol
+def r7_bridge_result_outcome(outcome: str) -> Protocol:
+    async def after(
+        context: Context, step: AfterToolCall, escalations: Escalations
+    ) -> Decision | None:
+        if step.call.arguments == {"x": 1, "y": 1} or step.call.function == "echo":
+            if outcome == "terminate":
+                return Decision.terminate("stop host result")
+        return None
+
+    return after
+
+
+@monitor
+def r7_bridge_result_failure() -> MonitorGroup:
+    async def after(context: Context, step: AfterToolCall) -> Observation | None:
+        if step.call.arguments == {"x": 1, "y": 1} or step.call.function == "echo":
+            raise RuntimeError("host result failed")
+        return None
+
+    return MonitorGroup(after)
+
+
+@pytest.mark.parametrize("bridge_outcome", ["normal", "terminate", "fail"])
+def test_a_native_call_under_a_host_call_s_id_keeps_its_tool_steps(
+    bridge_outcome: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_defers_a_bridged_host_call(native_first=True)),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="shared",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            r7_tool_calls(
+                ToolCall(id="shared", function="addition", arguments={"x": 5, "y": 5})
+            ),
+            done(),
+        ),
+        sentinel=[
+            r7_probe(seen, copies=True),
+            r7_bridge_result_outcome(bridge_outcome),
+            *([r7_bridge_result_failure()] if bridge_outcome == "fail" else []),
+        ],
+        # the bridge's request reporting the result follows the native turn
+        inferred="two threads in one conversation"
+        if bridge_outcome != "terminate"
+        else None,
+    )
+    events = logged_sample(log).events
+    live = [
+        (e.stage, seen[e.explanation or ""].call.arguments)
+        for e in events
+        if isinstance(e, SentinelEvent)
+        and e.path == "r7_probe"
+        and e.stage.startswith("tool")
+    ]
+    assert live == [
+        ("tool_call", {"x": 1, "y": 1}),
+        ("tool_call", {"x": 5, "y": 5}),
+        ("tool_result", {"x": 5, "y": 5}),
+        ("tool_result", {"x": 1, "y": 1}),
+    ]
+    replay = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.arguments == {"x": 5, "y": 5}
+    )
+    assert [(stage, args) for stage, _, args in tool_step_calls(replay)] == [
+        ("tool_call", {"x": 5, "y": 5}),
+        ("tool_result", {"x": 5, "y": 5}),
+    ]
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+@agent
+def r7_scaffold_reports_after_a_failed_native_call(outcome: str) -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import inspect_completions_api_request
+
+        bridge, tools = await r7_host_bridge(state)
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "Echo text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                    },
+                },
+            }
+        )
+        messages: list[Any] = [{"role": "user", "content": "echo"}]
+        completion = await inspect_completions_api_request(
+            {"model": "inspect", "messages": messages, "tools": tools}, None, bridge
+        )
+        [proposed] = completion.choices[0].message.tool_calls or []
+        messages.append(completion.choices[0].message.model_dump(exclude_none=True))
+        history: list[ChatMessage] = [ChatMessageUser(content="native")]
+        native_tool = explodes()
+        output = await get_model().generate(history, tools=[native_tool])
+        history.append(output.message)
+        with pytest.raises(RuntimeError, match="boom"):
+            await execute_tools(history, [native_tool])
+        messages.append(
+            {"role": "tool", "tool_call_id": proposed.id, "content": "scaffold result"}
+        )
+        if outcome == "terminate":
+            with pytest.raises(TerminateSampleError, match="stop host result"):
+                await inspect_completions_api_request(
+                    {"model": "inspect", "messages": messages, "tools": tools},
+                    None,
+                    bridge,
+                )
+        else:
+            await inspect_completions_api_request(
+                {"model": "inspect", "messages": messages, "tools": tools}, None, bridge
+            )
+        return state
+
+    return execute
+
+
+def test_a_scaffold_result_never_becomes_a_failed_native_call_s_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    for outcome in ("normal", "terminate"):
+        seen: dict[str, Step] = {}
+        log = run_logged(
+            as_solver(r7_scaffold_reports_after_a_failed_native_call(outcome)),
+            outputs(
+                r7_tool_calls(
+                    ToolCall(id="shared", function="echo", arguments={"text": "x"})
+                ),
+                r7_tool_calls(ToolCall(id="shared", function="explodes", arguments={})),
+                done(),
+            ),
+            sentinel=[r7_probe(seen, copies=True), r7_bridge_result_outcome(outcome)],
+            # the bridge's thread and the native one share a span: where the
+            # bridge's carries on after the native turn, continuity follows it,
+            # so without origins the native turn is utility
+            inferred=(
+                "two threads in one conversation" if outcome == "normal" else None
+            ),
+        )
+        live = [
+            (event.stage, seen[event.explanation or ""].call.function)
+            for event in logged_sample(log).events
+            if isinstance(event, SentinelEvent)
+            and event.path == "r7_probe"
+            and event.stage.startswith("tool")
+        ]
+        assert live == [
+            ("tool_call", "echo"),
+            ("tool_call", "explodes"),
+            ("tool_result", "echo"),
+        ]
+        caplog.clear()
+        replay = assert_replay_skips_bridge_steps(
+            log, seen, lambda step: step.call.function == "explodes"
+        )
+        assert [
+            (stage, function) for stage, function, _ in tool_step_calls(replay)
+        ] == [("tool_call", "explodes")]
+        assert bridge_warning_ids(caplog) == ["shared"]
+
+
+def test_a_result_only_sentinel_s_bridge_check_never_becomes_a_native_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log = run_logged(
+        as_solver(r7_scaffold_reports_after_a_failed_native_call("terminate")),
+        outputs(
+            r7_tool_calls(
+                ToolCall(id="shared", function="echo", arguments={"text": "x"})
+            ),
+            r7_tool_calls(ToolCall(id="shared", function="explodes", arguments={})),
+            done(),
+        ),
+        sentinel=[r7_bridge_result_outcome("terminate")],
+    )
+    stages = [
+        event.stage
+        for event in logged_sample(log).events
+        if isinstance(event, SentinelEvent) and event.stage.startswith("tool")
+    ]
+    assert stages == ["tool_result"]
+    # the failed native call has no result step; the bridge's check is skipped
+    replay = replayed(log)
+    assert [(stage, function) for stage, function, _ in tool_step_calls(replay)] == [
+        ("tool_call", "explodes")
+    ]
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+@reviewer
+def r7_holds_result_review(
+    reviewing: anyio.Event,
+    released: anyio.Event,
+    decision: Literal["continue", "terminate", "raise"] = "continue",
+) -> Reviewer:
+    async def review_result(
+        message: str,
+        call: ToolCall,
+        result: ChatMessageTool,
+        output: ToolResult,
+        view: ToolCallView,
+        history: list[ChatMessage],
+    ) -> Review:
+        reviewing.set()
+        await released.wait()
+        if decision == "raise":
+            raise RuntimeError("review service unavailable")
+        return Review(decision=decision)
+
+    return review_result
+
+
+@monitor
+def r7_holds_native_result(gate: dict[str, anyio.Event]) -> MonitorGroup:
+    """Hold the check of the native result `2` until the gate is released, then abstain."""
+
+    async def after_call(context: Context, step: AfterToolCall) -> Observation | None:
+        if step.result.text == "2":
+            gate["reviewing"].set()
+            await gate["released"].wait()
+        return None
+
+    return MonitorGroup(after_call)
+
+
+OrphanHold = Literal[
+    "review",
+    "terminating review",
+    "failing review",
+    "check",
+    "check after a yielding allocator",
+]
+
+
+@agent
+def r7_reports_orphan_result_after_native_call(
+    held: OrphanHold | None, gate: dict[str, anyio.Event] | None = None
+) -> Agent:
+    """A bridge reporting an orphan result under a native call's id: after the native call failed, or while its successful result is held in a review (that continues, terminates or raises) or in its sentinel check (`r7_holds_native_result` with `gate`), which can begin after a span-id allocator awaited a sibling's span."""
+
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import inspect_completions_api_request
+
+        bridge, tools = await r7_host_bridge(state)
+        history: list[ChatMessage] = [ChatMessageUser(content="native")]
+        native_tool = addition() if held is not None else explodes()
+        output = await get_model().generate(history, tools=[native_tool])
+        history.append(output.message)
+
+        async def report_orphan() -> None:
+            messages: list[dict[str, Any]] = [
+                {"role": "user", "content": "orphan"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "shared",
+                    "name": "echo",
+                    "content": "orphan result",
+                },
+            ]
+            with pytest.raises(TerminateSampleError, match="stop orphan"):
+                await inspect_completions_api_request(
+                    {"model": "inspect", "messages": messages, "tools": tools},
+                    None,
+                    bridge,
+                )
+
+        async def held_native_call() -> None:
+            assert held is not None
+            reviewing, released = anyio.Event(), anyio.Event()
+            if gate is not None:
+                gate.update(reviewing=reviewing, released=released)
+            review = (
+                []
+                if held.startswith("check")
+                else [
+                    ReviewPolicy(
+                        r7_holds_result_review(
+                            reviewing,
+                            released,
+                            "terminate"
+                            if held == "terminating review"
+                            else "raise"
+                            if held == "failing review"
+                            else "continue",
+                        ),
+                        "addition",
+                    )
+                ]
+            )
+
+            async def native() -> None:
+                try:
+                    await execute_tools(history, [native_tool], review=review)
+                except TerminateSampleError:
+                    raise
+                except RuntimeError:
+                    # the scaffold carries on after its reviewer failed
+                    assert held == "failing review"
+
+            async def orphan() -> None:
+                await reviewing.wait()
+                try:
+                    await report_orphan()
+                finally:
+                    released.set()
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(native)
+                tg.start_soon(orphan)
+
+        if held == "check after a yielding allocator":
+            # the native result check's span id waits while a sibling records a
+            # span, so that span, not the check, follows the native tool span
+            requested, allocated = anyio.Event(), anyio.Event()
+
+            async def allocate(
+                name: str, parent_id: str | None, requested_id: str | None
+            ) -> str:
+                if name == "sentinel" and not requested.is_set():
+                    requested.set()
+                    await allocated.wait()
+                return requested_id or uuid()
+
+            async def sibling() -> None:
+                await requested.wait()
+                async with span("orchestrator", type="rpc"):
+                    pass
+                allocated.set()
+
+            with span_id_provider(allocate):
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(sibling)
+                    await held_native_call()
+        elif held is not None:
+            await held_native_call()
+        else:
+            with pytest.raises(RuntimeError, match="boom"):
+                await execute_tools(history, [native_tool])
+            await report_orphan()
+        state.output = await get_model().generate(state.messages)
+        return state
+
+    return execute
+
+
+@protocol
+def r7_terminate_orphan_result() -> Protocol:
+    async def after(
+        context: Context, step: AfterToolCall, escalations: Escalations
+    ) -> Decision | None:
+        if step.result.text == "orphan result":
+            return Decision.terminate("stop orphan")
+        return None
+
+    return after
+
+
+@pytest.mark.parametrize("held", [None, "review"])
+def test_an_orphan_bridge_result_under_a_native_call_s_id_is_not_its_result(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    held: OrphanHold | None,
+) -> None:
+    Panel("approve", "allowed").install(monkeypatch)
+    seen: dict[str, Step] = {}
+    native_call = (
+        ToolCall(id="shared", function="addition", arguments={"x": 1, "y": 1})
+        if held
+        else ToolCall(id="shared", function="explodes", arguments={})
+    )
+    log = run_logged(
+        as_solver(r7_reports_orphan_result_after_native_call(held)),
+        outputs(r7_tool_calls(native_call), done()),
+        sentinel=[
+            r7_probe(seen, copies=True),
+            h_ask("tool_result", ["approve", "reject"]),
+            r7_terminate_orphan_result(),
+        ],
+    )
+    sample = logged_sample(log)
+    live = [
+        (event.stage, seen[event.explanation or ""].call.function)
+        for event in sample.events
+        if isinstance(event, SentinelEvent)
+        and event.path == "r7_probe"
+        and event.stage.startswith("tool")
+    ]
+    native = next(
+        event
+        for event in sample.events
+        if isinstance(event, ToolEvent) and event.id == "shared"
+    )
+    if held:
+        # the orphan's check, then the native call's, both while the native
+        # call awaited its result review
+        assert live == [
+            ("tool_call", "addition"),
+            ("tool_result", ""),
+            ("tool_result", "addition"),
+        ]
+        assert native.failed is not True
+    else:
+        assert live == [("tool_call", "explodes"), ("tool_result", "")]
+        assert native.failed is True
+    assert (
+        sum(
+            call.id == "shared"
+            for event in sample.events
+            if isinstance(event, ModelEvent)
+            for call in event.output.message.tool_calls or []
+        )
+        == 1
+    )
+
+    replay = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.function != ""
+    )
+    assert [(stage, function) for stage, function, _ in tool_step_calls(replay)] == (
+        [("tool_call", "addition"), ("tool_result", "addition")]
+        if held
+        else [("tool_call", "explodes")]
+    )
+    assert all(
+        step.step.result.text == "2"
+        for step in replay
+        if isinstance(step.step, AfterToolCall)
+    )
+    model_steps = [step.step for step in replay if step.stage.startswith("model")]
+    assert [len(step.human_decisions or []) for step in model_steps] == (
+        [0, 0, 2, 2] if held else [0, 0, 1, 1]
+    )
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+@protocol(name="inspect_sentinel/human")
+def r7_asks_about_orphan_result() -> Protocol:
+    async def after(
+        context: Context, step: AfterToolCall, escalations: Escalations
+    ) -> Decision | None:
+        if step.result.text == "orphan result":
+            return answered(
+                await context.host.ask_human(step, (), ["approve", "reject"])
+            )
+        return None
+
+    return after
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        "review",
+        "terminating review",
+        "failing review",
+        "check",
+        "check after a yielding allocator",
+    ],
+)
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+def test_an_orphan_result_s_approval_never_reaches_a_native_result(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    held: OrphanHold,
+    backend: str,
+) -> None:
+    monkeypatch.setenv("INSPECT_ASYNC_BACKEND", backend)
+    Panel("approve", "orphan approval").install(monkeypatch)
+    gate: dict[str, anyio.Event] = {}
+    log = run_logged(
+        as_solver(r7_reports_orphan_result_after_native_call(held, gate)),
+        outputs(
+            r7_tool_calls(
+                ToolCall(id="shared", function="addition", arguments={"x": 1, "y": 1})
+            ),
+            done(),
+        ),
+        sentinel=[
+            r7_holds_native_result(gate),
+            r7_asks_about_orphan_result(),
+            r7_terminate_orphan_result(),
+        ],
+    )
+    sample = logged_sample(log)
+    begins = {e.id: e for e in sample.events if isinstance(e, SpanBeginEvent)}
+    results = [
+        (event.span_id, event.path)
+        for event in sample.events
+        if isinstance(event, SentinelEvent) and event.stage == "tool_result"
+    ]
+    # the orphan's check alone, in a bridge check's span: the native call's
+    # abstained, or its reviewer ended the call before it
+    assert [path for _, path in results] == ["human", "r7_terminate_orphan_result"]
+    [orphan_span] = {span for span, _ in results}
+    assert orphan_span is not None
+    assert begins[orphan_span].name == "sentinel_bridge"
+    native = next(
+        event
+        for event in sample.events
+        if isinstance(event, ToolEvent) and event.id == "shared"
+    )
+    failed = held in ("terminating review", "failing review")
+    assert native.failed is (True if failed else None)
+    if held == "check after a yielding allocator":
+        assert any(begin.type == "rpc" for begin in begins.values())
+
+    replay = replayed(log)
+    assert [(stage, function) for stage, function, _ in tool_step_calls(replay)] == [
+        ("tool_call", "addition"),
+        *([] if failed else [("tool_result", "addition")]),
+    ]
+    # the person approved the orphan, never the native result
+    assert not any(step.recorded_answers for step in replay)
+    # and the turn after it, which a terminating review ends the sample before,
+    # sees that decision
+    [*_, last] = [step.step for step in replay if step.stage.startswith("model")]
+    assert [
+        (decision.stage, decision.step_id, decision.decided.report.explanation)
+        for decision in last.human_decisions or []
+    ] == (
+        []
+        if held == "terminating review"
+        else [("tool_result", "shared", "orphan approval")]
+    )
+    assert bridge_warning_ids(caplog) == ["shared"]
+
+
+@agent
+def r7_reuses_one_native_call_id(turns: int) -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        for turn in range(turns):
+            output = await get_model().generate(state.messages, tools=[addition()])
+            state.messages.append(output.message)
+            result = await execute_tools(state.messages, [addition()])
+            state.messages.extend(result.messages)
+        return state
+
+    return execute
+
+
+def reused_id_replay_work(
+    turns: int, monkeypatch: pytest.MonkeyPatch
+) -> tuple[int, list[tuple[str, int, str | None]]]:
+    """Span lookups while replaying serial native calls under one id, and the tool steps built.
+
+    Replay rejects a second step under one id (`_built`), so the steps are
+    collected in its place.
+    """
+    from inspect_ai._sentinel import _replay
+
+    seen: dict[str, Step] = {}
+    # not run_logged, whose replays would reject the second step
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=as_solver(r7_reuses_one_native_call_id(turns)),
+        sentinel=[r7_probe(seen)],
+    )
+    log = eval(
+        task,
+        model=outputs(
+            *[
+                r7_tool_calls(
+                    ToolCall(
+                        id="shared", function="addition", arguments={"x": n, "y": 1}
+                    )
+                )
+                for n in range(turns)
+            ]
+        ),
+    )[0]
+    assert log.status == "success", log.error
+
+    class Counted(dict[Any, Any]):
+        reads = 0
+
+        def __getitem__(self, key: Any) -> Any:
+            Counted.reads += 1
+            return super().__getitem__(key)
+
+        def get(self, key: Any, default: Any = None) -> Any:
+            Counted.reads += 1
+            return super().get(key, default)
+
+    original = _replay._Driver.__init__
+
+    def counting_init(driver: Any, *args: Any, **kwargs: Any) -> None:
+        original(driver, *args, **kwargs)
+        driver.begins = Counted()
+        driver.ends = Counted()
+
+    built: list[tuple[str, int, str | None]] = []
+
+    def collect(
+        driver: Any, step_id: str, stage: str, step: Step, span: str | None
+    ) -> None:
+        if stage.startswith("tool"):
+            built.append((stage, step.call.arguments["x"], span))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_replay._Driver, "__init__", counting_init)
+        patch.setattr(_replay._Driver, "_built", collect)
+        replayed(log)
+    return Counted.reads, built
+
+
+def test_native_calls_reusing_one_id_keep_their_checks_in_linear_span_lookups(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    small, _ = reused_id_replay_work(12, monkeypatch)
+    large, built = reused_id_replay_work(24, monkeypatch)
+    assert large <= 2.2 * small, (small, large)
+    assert [(stage, n) for stage, n, _ in built] == [
+        (stage, n) for n in range(24) for stage in ("tool_call", "tool_result")
+    ]
+    spans = [span for _, _, span in built]
+    assert None not in spans and len(set(spans)) == len(spans)
+    assert "inspect_ai._sentinel._replay" not in {
+        record.name for record in caplog.records
+    }
+
+
+@agent
+def r7_allocates_span_ids_with_a_yield(bridged: bool, orchestrated: bool) -> Agent:
+    """Three parallel native calls (`ordered_addition`) under a span-id provider that awaits, after a bridged host call with `bridged`.
+
+    With `orchestrated`, the provider holds each native tool span until all
+    three calls have been checked, and each result check until all three calls
+    have run, so other calls' events separate every check from its tool span.
+    """
+
+    async def execute(state: AgentState) -> AgentState:
+        checked, ran = anyio.Event(), anyio.Event()
+        arrived = {"tool": 0, "result": 0}
+
+        async def gather(stage: str, released: anyio.Event) -> None:
+            arrived[stage] += 1
+            if arrived[stage] == 3:
+                released.set()
+            await released.wait()
+
+        async def allocate(
+            name: str, parent_id: str | None, requested_id: str | None
+        ) -> str:
+            await anyio.lowlevel.checkpoint()
+            if not orchestrated:
+                pass
+            elif name == "ordered_addition":
+                await gather("tool", checked)
+            elif name == "sentinel" and checked.is_set():
+                await gather("result", ran)
+            return requested_id or uuid()
+
+        with span_id_provider(allocate):
+            if bridged:
+                state = await r7_runs_a_bridged_host_tool()(state)
+            tool = ordered_addition()
+            output = await get_model().generate(state.messages, tools=[tool])
+            state.messages.append(output.message)
+            result = await execute_tools(state.messages, [tool])
+            state.messages.extend(result.messages)
+        return state
+
+    return execute
+
+
+def native_checks_apart(sample: EvalSample) -> set[str]:
+    """The stages at which some native call's check is not adjacent to its tool span."""
+    events = sample.events
+    begins = {
+        event.id: index
+        for index, event in enumerate(events)
+        if isinstance(event, SpanBeginEvent)
+    }
+    ends = {
+        event.id: index
+        for index, event in enumerate(events)
+        if isinstance(event, SpanEndEvent)
+    }
+    checks = {
+        (event.stage, event.step_id): event.span_id
+        for event in events
+        if isinstance(event, SentinelEvent) and event.span_id is not None
+    }
+    apart: set[str] = set()
+    for index, event in enumerate(events):
+        if not isinstance(event, ToolEvent) or event.metadata:
+            continue
+        tool_span = cast(SpanBeginEvent, events[index - 1]).id
+        before = checks[("tool_call", event.id)]
+        after = checks[("tool_result", event.id)]
+        if ends[before] != begins[tool_span] - 1:
+            apart.add("tool_call")
+        if begins[after] != ends[tool_span] + 1:
+            apart.add("tool_result")
+    return apart
+
+
+PARALLEL_NATIVE_CALLS = calls(
+    *[("ordered_addition", {"x": n, "y": 10}) for n in (1, 2, 3)]
+)
+
+
+@pytest.mark.parametrize("orchestrated", [False, True])
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+def test_native_checks_replay_under_a_span_id_provider_that_yields(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    backend: str,
+    orchestrated: bool,
+) -> None:
+    monkeypatch.setenv("INSPECT_ASYNC_BACKEND", backend)
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_allocates_span_ids_with_a_yield(False, orchestrated)),
+        outputs(PARALLEL_NATIVE_CALLS),
+        sentinel=[r7_probe(seen, copies=True)],
+    )
+    if orchestrated:
+        assert native_checks_apart(logged_sample(log)) == {
+            "tool_call",
+            "tool_result",
+        }
+    with caplog.at_level(logging.WARNING):
+        replay = assert_logged_replay_equals_live(log, seen)
+    assert len([step for step in replay if step.stage.startswith("tool")]) == 6
+    assert "inspect_ai._sentinel._replay" not in {
+        record.name for record in caplog.records
+    }
+
+
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+def test_native_checks_under_a_span_id_provider_that_yields_beside_a_bridge_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    backend: str,
+) -> None:
+    monkeypatch.setenv("INSPECT_ASYNC_BACKEND", backend)
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_allocates_span_ids_with_a_yield(True, orchestrated=True)),
+        outputs(call("mcp__host__addition", x=1, y=1), PARALLEL_NATIVE_CALLS),
+        sentinel=[r7_probe(seen, copies=True)],
+    )
+    sample = logged_sample(log)
+    assert native_checks_apart(sample) == {"tool_call", "tool_result"}
+    with caplog.at_level(logging.WARNING):
+        replay = assert_replay_skips_bridge_steps(
+            log, seen, lambda step: step.call.function == "ordered_addition"
+        )
+    assert len(tool_step_calls(replay)) == 6
+    [host] = [e.id for e in sample.events if isinstance(e, ToolEvent) and e.metadata]
+    assert bridge_warning_ids(caplog) == [host]
+
+
+@agent
+def r6_executes_one_of_two_native_proposals() -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        tool = addition()
+        await get_model().generate(state.messages, tools=[tool])
+        output = await get_model().generate(state.messages, tools=[tool])
+        state.messages.append(output.message)
+        result = await execute_tools(state.messages, [tool])
+        state.messages.extend(result.messages)
+        return state
+
+    return execute
+
+
+def test_unused_native_candidate_does_not_hide_native_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r6_executes_one_of_two_native_proposals()),
+        outputs(
+            r7_tool_calls(
+                ToolCall(id="shared", function="addition", arguments={"x": 1, "y": 1})
+            ),
+            r7_tool_calls(
+                ToolCall(id="shared", function="addition", arguments={"x": 2, "y": 2})
+            ),
+        ),
+        sentinel=[r7_probe(seen)],
+    )
+    live = [
+        seen[event.explanation or ""]
+        for event in logged_sample(log).events
+        if isinstance(event, SentinelEvent)
+        and event.path == "r7_probe"
+        and event.stage.startswith("tool")
+    ]
+    assert [type(step) for step in live] == [BeforeToolCall, AfterToolCall]
+    replay = [
+        step
+        for step in replayed(log)
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert [type(step.step) for step in replay] == [BeforeToolCall, AfterToolCall]
+    for actual, rebuilt in zip(live, replay):
+        assert_step_equals_live((rebuilt.stage, rebuilt.id), rebuilt, actual)
+    assert replay_warnings(caplog) == []
+
+
+def test_human_decision_at_shared_id_result_reaches_later_replay_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Panel("approve", "allowed").install(monkeypatch)
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_scaffold_reports_after_a_failed_native_call("normal")),
+        outputs(
+            r7_tool_calls(
+                ToolCall(id="shared", function="echo", arguments={"text": "x"})
+            ),
+            r7_tool_calls(ToolCall(id="shared", function="explodes", arguments={})),
+            done(),
+        ),
+        sentinel=[
+            r7_probe(seen, copies=True),
+            h_ask("tool_result", ["approve", "reject"]),
+        ],
+        # as in test_a_scaffold_result_never_becomes_a_failed_native_call_s_result
+        inferred="two threads in one conversation",
+    )
+    live = [
+        seen[event.explanation or ""]
+        for event in logged_sample(log).events
+        if isinstance(event, SentinelEvent)
+        and event.path == "r7_probe"
+        and event.stage.startswith("model")
+    ]
+    replay = replayed(log)
+    model_steps = [step.step for step in replay if step.stage.startswith("model")]
+    assert not any(isinstance(step.step, AfterToolCall) for step in replay)
+    assert [len(step.human_decisions or []) for step in live] == [0, 0, 0, 0, 1, 1]
+    assert [len(step.human_decisions or []) for step in model_steps] == [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+    ]
+    for actual, rebuilt in zip(live, model_steps):
+        assert comparable(rebuilt.human_decisions) == comparable(actual.human_decisions)
+
+
+@agent
+def r7_runs_a_host_call_outside_its_producer() -> Agent:
+    """A bridged conversation in an agent span of its own, whose host call the service runs in the enclosing span."""
+
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+        from inspect_ai.agent._bridge.sandbox.service import call_tool
+
+        bridge, tools = await r7_host_bridge(state)
+        messages: list[Any] = [{"role": "user", "content": "What is 1 + 1?"}]
+
+        async def request() -> Any:
+            completion = await inspect_completions_api_request(
+                {"model": "inspect", "messages": messages, "tools": tools}, None, bridge
+            )
+            message = completion.choices[0].message
+            messages.append(message.model_dump(exclude_none=True))
+            return message.tool_calls or []
+
+        outer, outer_agent = current_span_id(), current_agent_span_id()
+        assert outer is not None
+        async with span("producer", type="agent"):
+            [proposed] = await request()
+            with in_span(outer, outer_agent):
+                result = await call_tool(bridge)(
+                    "host", "addition", json.loads(proposed.function.arguments)
+                )
+            messages.append(
+                {"role": "tool", "tool_call_id": proposed.id, "content": str(result)}
+            )
+            await request()
+        return state
+
+    return execute
+
+
+class HostDecision(NamedTuple):
+    log: EvalLog
+    events: list[Event]
+    producer: str
+    decided: SentinelEvent
+    live: list[Step]
+
+
+def r7_host_decision_outside_its_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> HostDecision:
+    """A person's approval of a host call's result, checked in the producer's conversation from outside its span; `live` is the model steps as the probe saw them."""
+    Panel("approve", "allowed").install(monkeypatch)
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r7_runs_a_host_call_outside_its_producer()),
+        outputs(
+            r7_tool_calls(
+                ToolCall(
+                    id="cross",
+                    function="mcp__host__addition",
+                    arguments={"x": 1, "y": 1},
+                )
+            ),
+            done(),
+        ),
+        sentinel=[
+            r7_probe(seen, copies=True),
+            h_ask("tool_result", ["approve", "reject"]),
+        ],
+    )
+    events = logged_sample(log).events
+    begins = {e.id: e for e in events if isinstance(e, SpanBeginEvent)}
+    [producer] = [e.id for e in begins.values() if e.name == "producer"]
+    [ran] = [e for e in events if isinstance(e, ToolEvent)]
+    [decided] = [
+        e
+        for e in events
+        if isinstance(e, SentinelEvent) and e.factory == "inspect_sentinel/human"
+    ]
+    assert decided.conversation == producer
+    assert ran.span_id is not None and begins[ran.span_id].parent_id != producer
+    live = [
+        seen[e.explanation or ""]
+        for e in events
+        if isinstance(e, SentinelEvent)
+        and e.path == "r7_probe"
+        and e.stage.startswith("model")
+    ]
+    assert [len(s.human_decisions or []) for s in live] == [0, 0, 1, 1]
+    return HostDecision(log, list(events), producer, decided, live)
+
+
+@pytest.mark.parametrize("stored_timeline", [False, True])
+def test_a_person_s_decision_at_a_host_call_run_outside_its_producer_s_span_reaches_later_turns(
+    monkeypatch: pytest.MonkeyPatch, stored_timeline: bool
+) -> None:
+    log, events, producer, _, _ = r7_host_decision_outside_its_producer(monkeypatch)
+    turns = [e for e in events if isinstance(e, ModelEvent)]
+    timeline = Timeline(
+        name="target",
+        description="",
+        root=TimelineSpan(
+            id="target",
+            name="target",
+            content=[TimelineEvent(event=e) for e in turns],
+        ),
+    )
+    replay = replay_events(
+        log, events, **({"timeline": timeline} if stored_timeline else {})
+    )
+    # a timeline that does not place the decision gives it the conversation
+    # of the model call that proposed the host call
+    assert [len(s.step.human_decisions or []) for s in replay] == [0, 0, 1, 1]
+    assert {s.step.conversation for s in replay} == {
+        "target" if stored_timeline else producer
+    }
+
+
+def test_a_person_s_decision_at_a_host_call_stays_in_the_branch_a_timeline_places_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log, events, _, decided, _ = r7_host_decision_outside_its_producer(monkeypatch)
+    first, second = [e for e in events if isinstance(e, ModelEvent)]
+    # the first turn and the decision in one conversation, the second turn in
+    # a branch of its own
+    timeline = Timeline(
+        name="split",
+        description="",
+        root=TimelineSpan(
+            id="first",
+            name="first",
+            content=[TimelineEvent(event=e) for e in events if e is not second],
+            branches=[
+                TimelineSpan(
+                    id="second",
+                    name="second",
+                    content=[TimelineEvent(event=second)],
+                )
+            ],
+        ),
+    )
+    assert any(
+        item.event is decided
+        for item in timeline.root.content
+        if isinstance(item, TimelineEvent)
+    )
+    replay = replay_events(log, events, timeline=timeline)
+    assert [
+        (s.step.conversation, len(s.step.human_decisions or [])) for s in replay
+    ] == [("first", 0), ("first", 0), ("second", 0), ("second", 0)]
+
+
+class NumberedPanel:
+    """A person who approves every question, numbering each answer by the call it is about (`answer #n for <id>`)."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def acp(**kwargs: object) -> Approval | None:
+            return None
+
+        async def panel(
+            message: str,
+            call: ToolCall,
+            view: ToolCallView,
+            history: object,
+            choices: list[str],
+        ) -> Approval:
+            self.asked.append(call.id)
+            return Approval(
+                decision="approve",
+                explanation=f"answer #{len(self.asked)} for {call.id}",
+            )
+
+        monkeypatch.setattr(acp_module, "request_human_approval_via_acp", acp)
+        monkeypatch.setattr(approver_module, "panel_approval", panel)
+
+    def answer(self, call_id: str, which: int) -> str:
+        """The explanation of the person's answer about `call_id`: `which` is an index into those answers."""
+        numbers = [n for n, asked in enumerate(self.asked, 1) if asked == call_id]
+        return f"answer #{numbers[which]} for {call_id}"
+
+
+R12_ECHO: Any = {
+    "type": "function",
+    "function": {
+        "name": "echo",
+        "description": "Echo the text.",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}},
+    },
+}
+
+
+async def r12_scaffold_turns(state: AgentState, create: Any) -> None:
+    """A scaffold handed the agent's history: it runs `echo` itself and asks again."""
+    from inspect_ai.model._openai import messages_to_openai
+
+    messages: list[Any] = await messages_to_openai(state.messages)
+    for _ in range(3):
+        completion = await create(messages)
+        message = completion.choices[0].message
+        messages.append(message.model_dump(exclude_none=True))
+        if not message.tool_calls:
+            return
+        for tool_call in message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.loads(tool_call.function.arguments)["text"],
+                }
+            )
+
+
+@agent(name="bridged", description="Continue in a bridged scaffold.")
+def r12_bridged() -> Agent:
+    """An in-process bridged scaffold continuing the conversation it is handed."""
+
+    async def execute(state: AgentState) -> AgentState:
+        from openai import AsyncOpenAI
+
+        async with agent_bridge(state) as bridge:
+            async with AsyncOpenAI(api_key="sk-test") as client:
+
+                async def create(messages: list[Any]) -> Any:
+                    return await client.chat.completions.create(
+                        model="inspect", messages=messages, tools=[R12_ECHO]
+                    )
+
+                await r12_scaffold_turns(state, create)
+            return bridge.state
+
+    return execute
+
+
+@agent
+def r12_sandbox_bridged() -> Agent:
+    """The sandbox bridge's request path, without a container."""
+
+    async def execute(state: AgentState) -> AgentState:
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+        from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
+
+        bridge = SandboxAgentBridge(
+            state=state,
+            filter=None,
+            retry_refusals=None,
+            compaction=None,
+            port=8080,
+            model=None,
+        )
+
+        async def create(messages: list[Any]) -> Any:
+            return await inspect_completions_api_request(
+                {"model": "inspect", "messages": messages, "tools": [R12_ECHO]},
+                None,
+                bridge,
+            )
+
+        await r12_scaffold_turns(state, create)
+        return bridge.state
+
+    return execute
+
+
+@agent
+def r12_react_then_bridges(bridges: int) -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        state = await react(tools=[addition()], submit=False)(state)
+        for _ in range(bridges):
+            state = await r12_bridged()(state)
+        return state
+
+    return execute
+
+
+R12_NATIVE = ToolCall(id="native_add", function="addition", arguments={"x": 1, "y": 1})
+R12_TRANSFER = ToolCall(
+    id="native_transfer", function="transfer_to_bridged", arguments={}
+)
+
+
+def r12_echo(call_id: str) -> ModelOutput:
+    return r7_tool_calls(
+        ToolCall(id=call_id, function="echo", arguments={"text": call_id})
+    )
+
+
+class HandedOver(NamedTuple):
+    solver: Solver | list[Solver]
+    outputs: list[ModelOutput]
+    bridge_calls: list[str]
+    """The calls the scaffolds ran."""
+    native_answers: dict[str, int]
+    """The native calls, each with which of the person's answers about it its own check got."""
+
+
+def r12_handed_over(flow: str) -> HandedOver:
+    """Native calls, then a bridge handed their history: the flows of a native solver or agent continuing into a bridged one."""
+    native = [r7_tool_calls(R12_NATIVE), done("native done")]
+    bridge = [r12_echo("bridge_echo"), done("bridge done")]
+    first = {"native_add": 0}
+    if flow == "as_solver":
+        return HandedOver(
+            [use_tools(addition()), generate(), as_solver(r12_bridged())],
+            native + bridge,
+            ["bridge_echo"],
+            first,
+        )
+    if flow == "react_then_bridge":
+        return HandedOver(
+            as_solver(r12_react_then_bridges(1)),
+            native + bridge,
+            ["bridge_echo"],
+            first,
+        )
+    if flow == "handoff":
+        # the transfer's result is checked after the handoff returns
+        return HandedOver(
+            as_solver(react(tools=[addition(), handoff(r12_bridged())], submit=False)),
+            [r7_tool_calls(R12_NATIVE), r7_tool_calls(R12_TRANSFER), *bridge, done()],
+            ["bridge_echo"],
+            {"native_add": 0, "native_transfer": -1},
+        )
+    if flow == "sandbox":
+        return HandedOver(
+            [use_tools(addition()), generate(), as_solver(r12_sandbox_bridged())],
+            native + bridge,
+            ["bridge_echo"],
+            first,
+        )
+    assert flow == "two_bridges"
+    return HandedOver(
+        as_solver(r12_react_then_bridges(2)),
+        [*native, *bridge, r12_echo("bridge_echo2"), done("bridge2 done")],
+        ["bridge_echo", "bridge_echo2"],
+        first,
+    )
+
+
+R12_FLOWS = ["as_solver", "react_then_bridge", "handoff", "sandbox", "two_bridges"]
+
+
+@pytest.mark.parametrize("flow", R12_FLOWS)
+def test_native_calls_handed_to_a_bridge_keep_their_own_checks(
+    flow: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    person = NumberedPanel()
+    person.install(monkeypatch)
+    handed = r12_handed_over(flow)
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        handed.solver,
+        outputs(*handed.outputs),
+        sentinel=[r7_probe(seen, copies=True), h_ask("tool_result", ["approve"])],
+    )
+    sample = logged_sample(log)
+    begins = {e.id: e for e in sample.events if isinstance(e, SpanBeginEvent)}
+    native_ids = set(handed.native_answers)
+    # the person is asked once about each result: a bridge does not check the
+    # results it was handed (the handoff's transfer, before the native call's
+    # own check; an earlier bridge's) again
+    assert sorted(person.asked) == sorted([*native_ids, *handed.bridge_calls])
+    # each scaffold call is checked in a bridge check's span
+    assert {
+        begins[e.span_id].name
+        for e in sample.events
+        if isinstance(e, SentinelEvent)
+        and e.span_id is not None
+        and e.step_id in handed.bridge_calls
+    } == {"sentinel_bridge"}
+
+    replay = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.id in native_ids
+    )
+    rebuilt = [
+        (step.stage, step.id)
+        for step in replay
+        if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert sorted(rebuilt) == sorted(
+        (stage, call_id)
+        for call_id in native_ids
+        for stage in ("tool_call", "tool_result")
+    )
+    for step in replay:
+        if step.stage == "tool_result":
+            assert dict(step.recorded_answers) == {
+                "human": HumanAnswer(
+                    decision="approve",
+                    reason=person.answer(step.id, handed.native_answers[step.id]),
+                )
+            }
+    assert bridge_warning_ids(caplog) == handed.bridge_calls
+
+
+R13_HELPER = ToolCall(id="helper_add", function="addition", arguments={"x": 2, "y": 3})
+
+
+def r13_helper_filter(helper: str) -> Any:
+    """A bridge request filter that, on the first request, runs a native tool loop (or a native agent) in a conversation of its own, then lets the request through."""
+    ran: list[bool] = []
+
+    async def run_helper(
+        model: Any,
+        messages: list[ChatMessage],
+        tools: list[Any],
+        tool_choice: Any,
+        config: Any,
+    ) -> None:
+        if ran:
+            return None
+        ran.append(True)
+        conversation: list[ChatMessage] = [ChatMessageUser(content="helper task")]
+        if helper == "agent":
+            await react(tools=[addition()], submit=False)(
+                AgentState(messages=conversation)
+            )
+            return None
+        assert helper == "tool_loop"
+        while True:
+            output = await get_model().generate(conversation, tools=[addition()])
+            conversation.append(output.message)
+            if not output.message.tool_calls:
+                return None
+            results, _ = await execute_tools(conversation, [addition()])
+            conversation.extend(results)
+
+    return run_helper
+
+
+@agent
+def r13_filtered(bridge: str, helper: str) -> Agent:
+    """A scaffold whose bridge's request filter runs a native helper."""
+
+    async def execute(state: AgentState) -> AgentState:
+        from openai import AsyncOpenAI
+
+        from inspect_ai.agent._bridge.completions import (
+            inspect_completions_api_request,
+        )
+        from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
+
+        request_filter = r13_helper_filter(helper)
+        if bridge == "sandbox":
+            sandbox_bridge = SandboxAgentBridge(
+                state=state,
+                filter=request_filter,
+                retry_refusals=None,
+                compaction=None,
+                port=8080,
+                model=None,
+            )
+
+            async def create_sandbox(messages: list[Any]) -> Any:
+                return await inspect_completions_api_request(
+                    {"model": "inspect", "messages": messages, "tools": [R12_ECHO]},
+                    None,
+                    sandbox_bridge,
+                )
+
+            await r12_scaffold_turns(state, create_sandbox)
+            return sandbox_bridge.state
+
+        assert bridge == "in_process"
+        async with agent_bridge(state, filter=request_filter) as in_process:
+            async with AsyncOpenAI(api_key="sk-test") as client:
+
+                async def create(messages: list[Any]) -> Any:
+                    return await client.chat.completions.create(
+                        model="inspect", messages=messages, tools=[R12_ECHO]
+                    )
+
+                await r12_scaffold_turns(state, create)
+            return in_process.state
+
+    return execute
+
+
+@pytest.mark.parametrize("helper", ["tool_loop", "agent"])
+@pytest.mark.parametrize("bridge", ["in_process", "sandbox"])
+def test_a_native_helper_in_a_bridge_request_filter_keeps_its_tool_steps(
+    bridge: str, helper: str
+) -> None:
+    seen: dict[str, Step] = {}
+    log = run_logged(
+        as_solver(r13_filtered(bridge, helper)),
+        outputs(r7_tool_calls(R13_HELPER), done("helper done"), done("bridge done")),
+        sentinel=[r7_probe(seen, copies=True)],
+    )
+    sample = logged_sample(log)
+    # the helper's generations ran under the bridge's routing
+    assert all(
+        event.requested_model == "inspect"
+        for event in sample.events
+        if isinstance(event, ModelEvent)
+    )
+    # the helper's conversation is not in the scaffold's history
+    assert all(
+        "helper" not in message.text
+        for message in sample.messages
+        if not isinstance(message, ChatMessageTool)
+    )
+    assert "helper_add" not in {
+        call.id
+        for message in sample.messages
+        if isinstance(message, ChatMessageAssistant)
+        for call in message.tool_calls or []
+    }
+
+    replay = assert_replay_skips_bridge_steps(
+        log, seen, lambda step: step.call.id == "helper_add"
+    )
+    rebuilt = [
+        step for step in replay if isinstance(step.step, BeforeToolCall | AfterToolCall)
+    ]
+    assert [(step.stage, step.id) for step in rebuilt] == [
+        ("tool_call", "helper_add"),
+        ("tool_result", "helper_add"),
+    ]
+    # the producer's context, which assert_replay_skips_bridge_steps has
+    # checked equals live's
+    for step in rebuilt:
+        assert step.step.input and step.step.input[-1].text == "helper task"
+        assert [tool.name for tool in step.step.tools or []] == ["addition"]
+        assert step.step.tool_choice is not None
+
+
+@approver
+def rejects_first_call() -> Approver:
+    decided: list[str] = []
+
+    async def approve(
+        message: str, call: ToolCall, view: ToolCallView, history: list[ChatMessage]
+    ) -> Approval:
+        decided.append(call.id)
+        return Approval(decision="reject" if len(decided) == 1 else "approve")
+
+    return approve
+
+
+def test_an_approver_refused_call_leaves_a_later_same_id_call_its_result_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # after Ransom's review 5810823986: the refused call took the result check
+    # of the later call that ran under its id
+    Panel("approve", "the sum is right").install(monkeypatch)
+    proposed = ModelOutput.for_tool_call(
+        "mockllm/model",
+        tool_name="addition",
+        tool_arguments={"x": 1, "y": 1},
+        tool_call_id="call_0",
+    )
+    seen: dict[str, Step] = {}
+    task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=[use_tools(addition()), generate()],
+        approval=[ApprovalPolicy(rejects_first_call(), "*")],
+        sentinel=[
+            r7_probe(seen, copies=True),
+            h_ask("tool_result", ["approve"]),
+        ],
+    )
+    log = eval(
+        task,
+        model=outputs(proposed, proposed, done()),
+        log_format="json",
+        log_dir=str(tmp_path),
+    )[0]
+    assert log.status == "success", log.error
+    assert log.location and log.location.endswith(".json")
+    refused, ran = [e for e in logged_sample(log).events if isinstance(e, ToolEvent)]
+    assert refused.error is not None and refused.error.type == "approval"
+    assert ran.error is None
+
+    replay = assert_logged_replay_equals_live(log, seen)
+    [result] = [step for step in replay if step.stage == "tool_result"]
+    assert dict(result.recorded_answers) == {
+        "human": HumanAnswer(decision="approve", reason="the sum is right")
+    }
+
+
+def _nested(depth: int) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for _ in range(depth):
+        value = {"deeper": value}
+    return value
+
+
+# a first call that never runs, each rejected another way; the model then
+# corrects it under the same id, as a provider that repeats ids sends it
+NEVER_RAN: dict[str, ToolCall] = {
+    "invalid_arguments": ToolCall(
+        id="call_0", function="keep", arguments={"payload": "bad"}
+    ),
+    "malformed_json": ToolCall(
+        id="call_0",
+        function="keep",
+        arguments={},
+        parse_error="Error parsing the following tool call arguments: {",
+    ),
+    "too_deep": ToolCall(
+        id="call_0", function="keep", arguments={"payload": _nested(101)}
+    ),
+    "unknown_tool": ToolCall(id="call_0", function="missing", arguments={}),
+}
+
+
+@pytest.mark.parametrize("watched", ["calls_and_results", "results"])
+@pytest.mark.parametrize("rejected", list(NEVER_RAN))
+def test_a_call_that_never_ran_leaves_a_later_same_id_call_its_result_check(
+    rejected: str, watched: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # after Ransom's review 5869595286: a call rejected before it ran took the
+    # result check, and the person's answer, of the corrected call under its id
+    Panel("approve", "the corrected call is fine").install(monkeypatch)
+
+    @tool
+    def keep() -> Tool:
+        async def execute(payload: dict[str, Any]) -> str:
+            """Keep a payload.
+
+            Args:
+                payload: The payload to keep.
+            """
+            return "kept"
+
+        return execute
+
+    def proposes(call: ToolCall) -> ModelOutput:
+        return ModelOutput(
+            model="mockllm/model",
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatMessageAssistant(content="", tool_calls=[call]),
+                    stop_reason="tool_calls",
+                )
+            ],
+        )
+
+    corrected = ToolCall(id="call_0", function="keep", arguments={"payload": {}})
+    seen: dict[str, Step] = {}
+    log = eval(
+        Task(
+            dataset=[Sample(input="Keep the payload")],
+            solver=[use_tools(keep()), generate()],
+            sentinel=[
+                *([r7_probe(seen, copies=True)] if watched != "results" else []),
+                h_ask("tool_result", ["approve"]),
+            ],
+        ),
+        model=outputs(proposes(NEVER_RAN[rejected]), proposes(corrected), done()),
+        log_format="json",
+        log_dir=str(tmp_path),
+    )[0]
+    assert log.status == "success", log.error
+    assert log.location and log.location.endswith(".json")
+    first, ran = [e for e in logged_sample(log).events if isinstance(e, ToolEvent)]
+    assert first.id == ran.id == "call_0"
+    assert first.error is not None and first.error.type == "parsing"
+    assert first.failed is None
+    assert ran.error is None and ran.arguments == {"payload": {}}
+
+    # read back from the log: the corrected call keeps its result check, the
+    # person's answer at it, and that decision in the steps after it
+    read = read_eval_log(log.location)
+    replay = (
+        # with nothing recording the live steps, there are none to compare
+        replayed(read)
+        if watched == "results"
+        else assert_logged_replay_equals_live(read, seen)
+    )
+    [result] = [step for step in replay if step.stage == "tool_result"]
+    assert isinstance(result.step, AfterToolCall)
+    assert result.step.call.arguments == {"payload": {}}
+    assert dict(result.recorded_answers) == {
+        "human": HumanAnswer(decision="approve", reason="the corrected call is fine")
+    }
+    later = [step.step for step in replay if step.stage == "model_input"][-1]
+    assert [
+        (decision.step_id, decision.stage) for decision in later.human_decisions or []
+    ] == [("call_0", "tool_result")]
+
+
+@pytest.mark.parametrize("error", [ToolParsingError, ToolApprovalError])
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+def test_a_concurrent_agent_s_refused_same_id_call_leaves_a_call_its_result_check(
+    error: type[Exception],
+    backend: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # agent B's approver-refused call under A's id ends before A's result
+    # check begins, and must leave it to A
+    monkeypatch.setenv("INSPECT_ASYNC_BACKEND", backend)
+    a_started, b_done = anyio.Event(), anyio.Event()
+
+    @tool
+    def rendezvous() -> Tool:
+        async def execute(kind: str) -> str:
+            """Fail once agent B's call was refused.
+
+            Args:
+                kind: The agent making the call.
+            """
+            a_started.set()
+            await b_done.wait()
+            raise error(f"refused inside {kind}'s tool")
+
+        return execute
+
+    @solver
+    def two_agents() -> Solver:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            async def agent_a() -> None:
+                await run(react(tools=[rendezvous()], submit=False), "agent A")
+
+            async def agent_b() -> None:
+                await a_started.wait()
+                await run(
+                    react(
+                        tools=[rendezvous()],
+                        submit=False,
+                        approval=[ApprovalPolicy(r7_decides("reject"), "*")],
+                    ),
+                    "agent B",
+                )
+                b_done.set()
+
+            await tg_collect([agent_a, agent_b])
+            return state
+
+        return solve
+
+    proposed = [
+        ModelOutput.for_tool_call(
+            "mockllm/model",
+            tool_name="rendezvous",
+            tool_arguments={"kind": kind},
+            tool_call_id="tool_call_0_0",
+        )
+        for kind in ("A", "B")
+    ]
+    seen: dict[str, Step] = {}
+    log = eval(
+        Task(
+            dataset=[Sample(input="run two agents")],
+            solver=two_agents(),
+            sentinel=[r7_probe(seen, copies=True)],
+        ),
+        model=outputs(*proposed, done(), done()),
+        log_format="json",
+        log_dir=str(tmp_path),
+    )[0]
+    assert log.status == "success", log.error
+    a, b = [e for e in logged_sample(log).events if isinstance(e, ToolEvent)]
+    assert a.arguments == {"kind": "A"} and b.arguments == {"kind": "B"}
+    assert a.error is not None and b.error is not None
+    assert b.error.type == "approval"
+
+    replay = assert_logged_replay_equals_live(log, seen)
+    assert [(stage, arguments) for stage, _, arguments in tool_step_calls(replay)] == [
+        ("tool_call", {"kind": "A"}),
+        ("tool_result", {"kind": "A"}),
+    ]
+
+
+@reviewer
+def checks_with_a_same_id_call(invalid: bool) -> Reviewer:
+    async def check(
+        message: str,
+        call: ToolCall,
+        result: ChatMessageTool,
+        output: ToolResult,
+        view: ToolCallView,
+        history: list[ChatMessage],
+    ) -> Review:
+        helper = get_model(
+            "mockllm/review-helper",
+            custom_outputs=[
+                ModelOutput.for_tool_call(
+                    "mockllm/review-helper",
+                    tool_name="addition",
+                    tool_arguments={"x": "one" if invalid else 1, "y": 1},
+                    tool_call_id="tool_call_0_0",
+                )
+            ],
+            memoize=False,
+        )
+        messages: list[ChatMessage] = [ChatMessageUser(content="Check the result")]
+        tools = [addition()]
+        proposed = await helper.generate(messages, tools=tools)
+        await execute_tools([*messages, proposed.message], tools)
+        return Review(decision="continue")
+
+    return check
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+@pytest.mark.parametrize("error", [ToolParsingError, ToolApprovalError])
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+def test_a_result_reviewer_s_same_id_call_leaves_the_reviewed_call_its_result_check(
+    invalid: bool,
+    error: type[Exception],
+    backend: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # after the pre-push review of 059291126: the reviewer's call under the
+    # reviewed call's id runs between that call's tool span and its result
+    # check, and took that check
+    monkeypatch.setenv("INSPECT_ASYNC_BACKEND", backend)
+    Panel("approve", "reviewed the tool error").install(monkeypatch)
+
+    @tool
+    def fails_after_running() -> Tool:
+        async def execute() -> str:
+            """Raise an error after running."""
+            raise error("could not interpret the tool output")
+
+        return execute
+
+    seen: dict[str, Step] = {}
+    log = eval(
+        Task(
+            dataset=[Sample(input="Run the tool")],
+            solver=[use_tools(fails_after_running()), generate()],
+            review=[
+                ReviewPolicy(checks_with_a_same_id_call(invalid), "fails_after_running")
+            ],
+            sentinel=[
+                r7_probe(seen, copies=True),
+                h_ask("tool_result", ["approve"]),
+            ],
+        ),
+        model=outputs(
+            ModelOutput.for_tool_call(
+                "mockllm/model",
+                tool_name="fails_after_running",
+                tool_arguments={},
+                tool_call_id="tool_call_0_0",
+            ),
+            done(),
+        ),
+        log_format="json",
+        log_dir=str(tmp_path),
+    )[0]
+    assert log.status == "success", log.error
+    events = [e for e in logged_sample(log).events if isinstance(e, ToolEvent)]
+    assert [e.function for e in events] == ["fails_after_running", "addition"]
+    assert events[0].error is not None
+    assert (events[1].error is not None) == invalid
+
+    # without origins, the reviewer's call reads as an agent call under the
+    # same id, so only the replay with origins is compared
+    live = live_steps(logged_sample(log), seen)
+    replay = replayed(log)
+    rebuilt: dict[tuple[str, str], ReplayStep] = {
+        (step.stage, step.id): step for step in replay
+    }
+    assert len(rebuilt) == len(replay) and set(rebuilt) == set(live)
+    for key, step in live.items():
+        assert_step_equals_live(key, rebuilt[key], step)
+    [result] = [step for step in replay if step.stage == "tool_result"]
+    assert dict(result.recorded_answers) == {
+        "human": HumanAnswer(decision="approve", reason="reviewed the tool error")
+    }

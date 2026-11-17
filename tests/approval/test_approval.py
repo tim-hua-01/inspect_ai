@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple
 
+import anyio
 import pytest
 from pydantic import (
     BaseModel,
@@ -23,6 +24,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic_core import PydanticSerializationError
+from test_helpers.limits import find_limit_event, priced_models, with_usage
 
 from inspect_ai import Task, eval
 from inspect_ai._util.content import ContentText
@@ -573,16 +575,89 @@ async def test_approver_inference_exempt_from_limits():
     assert turns.usage == 0
 
 
+@approver
+def judging_approver() -> Approver:
+    """Approver which consults the `judge` model role before approving."""
+
+    async def approve(
+        message: str,
+        call: ToolCall,
+        view: ToolCallView,
+        history: list[ChatMessage],
+    ) -> Approval:
+        await get_model(role="judge").generate("Should this call be approved?")
+        return Approval(decision="approve")
+
+    return approve
+
+
+@pytest.mark.parametrize(
+    "answer_tokens,limit_value",
+    [(100, None), (1_500, "$1.6000")],
+    ids=["agent_under_budget", "agent_over_budget"],
+)
+def test_approver_inference_is_not_charged_to_the_cost_limit(
+    answer_tokens: int, limit_value: str | None
+) -> None:
+    """A $100 approver call under a $1 limit; the agent's own calls stay metered."""
+    agent_model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            with_usage(
+                ModelOutput.for_tool_call(
+                    "mockllm/model",
+                    tool_name="addition",
+                    tool_arguments={"x": 1, "y": 1},
+                ),
+                100,
+            ),
+            with_usage(
+                ModelOutput.from_content("mockllm/model", content="2"), answer_tokens
+            ),
+        ],
+        memoize=False,
+    )
+    judge = get_model(
+        "mockllm/judge",
+        custom_outputs=[
+            with_usage(ModelOutput.from_content("mockllm/judge", "yes"), 100_000)
+        ],
+        memoize=False,
+    )
+    with priced_models({"model": 1000.0, "judge": 1000.0}):
+        [log] = eval(
+            approval_task(ApprovalPolicy(judging_approver(), "*")),
+            model=agent_model,
+            model_roles={"judge": judge},
+            cost_limit=1.0,
+        )
+
+    assert log.status == "success", log.error
+    assert log.samples
+    sample = log.samples[0]
+    tool_messages = [m for m in sample.messages if isinstance(m, ChatMessageTool)]
+    assert [m.text for m in tool_messages] == ["2"]
+    assert sample.model_usage["mockllm/judge"].total_cost == pytest.approx(100.0)
+    assert sample.role_usage["judge"].total_cost == pytest.approx(100.0)
+    if limit_value is None:
+        assert sample.limit is None
+    else:
+        # the agent's answer after approval is metered: $0.10 + $1.50, no judge spend
+        event = find_limit_event(log)
+        assert event is not None and event.type == "cost"
+        assert f"value: {limit_value};" in event.message
+
+
 def test_approval_policy_comma_separated_tools():
     policy = ApprovalPolicy(
-        approver=auto_approver(), tools="web_browser*, addition, python"
+        approver=auto_approver(), tools="custom_tool*, addition, python"
     )
     check_approval(policy, decision="approve")
 
 
 def test_approval_policy_comma_separated_list():
     policy = ApprovalPolicy(
-        approver=auto_approver(), tools=["web_browser*", "addition, python"]
+        approver=auto_approver(), tools=["custom_tool*", "addition, python"]
     )
     check_approval(policy, decision="approve")
 
@@ -1978,6 +2053,69 @@ def test_human_approver_rejects_modify_as_the_only_choice() -> None:
         human_approver(["modify"])
 
 
+@pytest.mark.parametrize(
+    ("choices", "match"),
+    [
+        ([], "at least one choice"),
+        (["approve", "reject", "approve"], "duplicate choice 'approve'"),
+    ],
+)
+def test_human_approver_rejects_empty_or_duplicate_choices(
+    choices: list[ApprovalDecision], match: str
+) -> None:
+    from inspect_ai.approval._human.approver import human_approver
+
+    with pytest.raises(ValueError, match=match):
+        human_approver(choices)
+
+
+async def test_panel_approval_answered_after_cancel_stays_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An answer that lands after the sample is cancelled doesn't replace the cancel."""
+    from inspect_ai.approval._human import panel as panel_module
+    from inspect_ai.approval._human.manager import (
+        human_approval_manager,
+        init_human_approval_manager,
+    )
+
+    async def no_panel(panel: object) -> None:
+        return None
+
+    monkeypatch.setattr(panel_module, "input_panel", no_panel)
+    monkeypatch.setattr(
+        "inspect_ai.log._samples.sample_active",
+        lambda: SimpleNamespace(
+            task="task", model="model", sample=SimpleNamespace(id=1), epoch=1
+        ),
+    )
+    init_human_approval_manager()
+    approvals = human_approval_manager()
+    requested = anyio.Event()
+    approvals.on_change(lambda action: requested.set())
+
+    answers: list[Approval] = []
+
+    async def ask() -> None:
+        call = ToolCall(id="t1", function="bash", arguments={"cmd": "ls"})
+        answers.append(
+            await panel_module.panel_approval(
+                "run it?", call, ToolCallView(), [], ["approve"]
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(ask)
+        await requested.wait()
+        ((request_id, _),) = approvals.approval_requests()
+        # the human answers before the cancelled sample task gets to run again
+        tg.cancel_scope.cancel()
+        approvals.complete_approval(request_id, Approval(decision="approve"))
+
+    assert answers == []
+    assert approvals.approval_requests() == []
+
+
 async def routed(call: ToolCall, tools: str | list[str], **arguments: str) -> bool:
     """Whether a policy for `tools` and `arguments` decides on `call`."""
     policy = (
@@ -2032,11 +2170,11 @@ async def test_policy_arguments_match_in_any_order() -> None:
 
 
 async def test_policy_comma_list_of_names_with_arguments() -> None:
-    for function in ("web_browser_type", "computer"):
+    for function in ("custom_tool", "computer"):
         call = make_tool_call(function, action="key")
-        assert await routed(call, "web_browser_type, computer", action="key")
+        assert await routed(call, "custom_tool, computer", action="key")
     call = make_tool_call("computer", action="type")
-    assert not await routed(call, "web_browser_type, computer", action="key")
+    assert not await routed(call, "custom_tool, computer", action="key")
 
 
 async def test_policy_arguments_are_whole_value_globs() -> None:
@@ -2176,8 +2314,8 @@ async def test_policy_case_and_separator_rules_on_windows(
     "tools",
     [
         "bash(cmd='ls', timeout=10)",
-        "computer(action='key', web_browser_type",
-        "web_browser_type, computer(action='key'",
+        "computer(action='key', custom_tool",
+        "custom_tool, computer(action='key'",
         "computer(*'key'*",
         'bash(cmd="ls"',
         "bash(cmd='it\\'s'",
